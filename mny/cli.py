@@ -834,13 +834,66 @@ def report_balance(output):
         )
 
     console.print(table)
-    console.print(f"\n[bold]总资产:[/bold] {_fmt_money(total)}")
+    nw = models.get_current_net_worth()
+    console.print(f"\n[bold]总资产:[/bold] {_fmt_money(nw['total_assets'])}"
+                  f"   [bold red]总负债:[/bold red] {_fmt_money(nw['total_liability'])}"
+                  f"   [bold green]净资产:[/bold green] {_fmt_money(nw['net_worth'])}")
+
+    # 净资产趋势
+    trend = models.get_net_worth_trend(months=6)
+    if any(x is not None for x in trend["net_worth"]):
+        t = Table(title="📈 最近 6 个月净资产趋势（含估算）")
+        t.add_column("月份", style="cyan", justify="center")
+        t.add_column("资产", justify="right")
+        t.add_column("负债", justify="right", style="red")
+        t.add_column("净资产", justify="right", style="bold green")
+        t.add_column("环比变化", justify="right")
+        prev_net = None
+        for i, p in enumerate(trend["periods"]):
+            assets = trend["assets"][i]
+            liab = trend["liabilities"][i]
+            net = trend["net_worth"][i]
+            if assets is None:
+                t.add_row(p, "-", "-", "-", "-")
+                continue
+            delta_s = "-"
+            if prev_net is not None:
+                delta = net - prev_net
+                delta_s = _fmt_amount(abs(delta), "income" if delta > 0 else "expense")
+            t.add_row(p, _fmt_money(assets), _fmt_money(liab), _fmt_money(net), delta_s)
+            prev_net = net
+        console.print(t)
 
     if output:
         if output.lower().endswith(".json"):
-            models.export_report_json(output, enriched)
+            models.export_report_json(output, {
+                "accounts": enriched,
+                "total_assets": nw["total_assets"],
+                "total_liability": nw["total_liability"],
+                "net_worth": nw["net_worth"],
+                "trend": trend,
+            })
         else:
-            models.export_report_csv(output, {"accounts": enriched, "total_assets": total})
+            rows = [dict(a) for a in enriched]
+            rows.append({
+                "id": "_NET_WORTH_",
+                "name": "_NET_WORTH_",
+                "type": "_TOTAL_",
+                "balance": round(nw["net_worth"], 2),
+                "total_assets": round(nw["total_assets"], 2),
+                "total_liability": round(nw["total_liability"], 2),
+            })
+            for i, p in enumerate(trend["periods"]):
+                if trend["assets"][i] is not None:
+                    rows.append({
+                        "id": "_TREND_",
+                        "name": p,
+                        "type": "_TREND_",
+                        "balance": round(trend["net_worth"][i], 2),
+                        "total_assets": round(trend["assets"][i], 2),
+                        "total_liability": round(trend["liabilities"][i], 2),
+                    })
+            models.export_report_csv(output, rows)
         console.print(f"[green]✓[/green] 已导出到 {output}")
 
 
@@ -1073,14 +1126,15 @@ def reconcile_run(account, file, fmt, yes, default_category, balance, show_dupes
 
     if missing:
         table = Table(title=f"❌ mny 中缺失的 {len(missing)} 条银行流水")
+        table.add_column("#", justify="right", style="cyan")
         table.add_column("日期", style="magenta")
         table.add_column("类型", justify="center")
         table.add_column("金额", justify="right")
         table.add_column("分类", style="yellow")
         table.add_column("备注")
-        for m in missing:
+        for idx, m in enumerate(missing, 1):
             ttype = "[green]收入[/green]" if m["type"] == "income" else "[red]支出[/red]"
-            table.add_row(m["date"], ttype, _fmt_amount(m["amount"], m["type"]),
+            table.add_row(str(idx), m["date"], ttype, _fmt_amount(m["amount"], m["type"]),
                           m.get("category") or "-", m.get("note") or "")
         console.print(table)
 
@@ -1092,14 +1146,43 @@ def reconcile_run(account, file, fmt, yes, default_category, balance, show_dupes
             if errors:
                 for err in errors:
                     console.print(f"  [yellow]- {err}[/yellow]")
-        elif Confirm.ask(f"要将这 {len(missing)} 条缺失记录补记到 mny 吗？", default=False):
-            for rec in missing:
-                rec["account"] = account
-            added, skipped, errors = models.apply_reconcile(missing, default_category)
-            console.print(f"[green]✓[/green] 已补记 {added} 条" + (f"，跳过 {skipped} 条" if skipped else ""))
-            if errors:
-                for err in errors:
-                    console.print(f"  [yellow]- {err}[/yellow]")
+        else:
+            answer = Prompt.ask(
+                f"选择要补记的编号（1-{len(missing)}，逗号分隔，支持区间如 1-3,5，或 'all' 全部，空=跳过全部）",
+                default="", show_default=False,
+            ).strip().lower()
+            if answer in ("all", "a"):
+                selected = list(range(len(missing)))
+            elif not answer:
+                selected = []
+            else:
+                selected = []
+                for part in answer.split(","):
+                    part = part.strip()
+                    if "-" in part:
+                        try:
+                            a, b = part.split("-", 1)
+                            selected.extend(range(int(a) - 1, int(b)))
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            selected.append(int(part) - 1)
+                        except ValueError:
+                            pass
+                selected = sorted({i for i in selected if 0 <= i < len(missing)})
+
+            if not selected:
+                console.print("[dim]已跳过全部缺失记录[/dim]")
+            else:
+                chosen = [missing[i] for i in selected]
+                for rec in chosen:
+                    rec["account"] = account
+                added, skipped, errors = models.apply_reconcile(chosen, default_category)
+                console.print(f"[green]✓[/green] 已补记 {added} 条（选了 {len(chosen)} 条）" + (f"，跳过 {skipped} 条" if skipped else ""))
+                if errors:
+                    for err in errors:
+                        console.print(f"  [yellow]- {err}[/yellow]")
 
     if extra:
         table = Table(title=f"⚠ mny 有但银行没出现的 {len(extra)} 条（可能是漏记、重复或日期不一致）")
@@ -1131,7 +1214,7 @@ def reconcile_run(account, file, fmt, yes, default_category, balance, show_dupes
         console.print(table)
 
     if show_dupes:
-        dup_result = models.find_duplicate_transactions(records, account)
+        dup_result = models.find_duplicate_transactions_exclusive(records, account)
         dup_bank = dup_result["duplicates_in_bank"]
         dup_mny = dup_result["duplicates_in_mny"]
         dup_both = dup_result["duplicates_both"]
@@ -1446,15 +1529,204 @@ def project_add(name, description):
     console.print(f"[green]✓[/green] 已添加项目: {name}")
 
 
+# ============================================================
+# snapshot: 净资产快照
+# ============================================================
+@cli.group()
+def snapshot():
+    """资产快照：记录某天账户余额、负债，查看净资产趋势"""
+    pass
+
+
+@snapshot.command("record")
+@click.option("-d", "--date", "date_str", default=None, help="日期 (YYYY-MM-DD)，默认今天")
+@click.option("-a", "--account", default=None,
+              help="账户名，为空则记录整体净资产快照")
+@click.option("-b", "--balance", type=float, required=True, help="账户余额或总资产")
+@click.option("-l", "--liability", type=float, default=0.0, help="负债金额")
+@click.option("-n", "--note", default=None, help="备注")
+def snapshot_record(date_str, account, balance, liability, note):
+    """记录某一天某个账户或整体的资产快照"""
+    if date_str is None:
+        date_str = date.today().isoformat()
+    try:
+        sid = models.add_snapshot(date_str, account, balance, liability, note)
+        who = account if account else "整体"
+        console.print(f"[green]✓[/green] 已记录 {who} 快照 #{sid}: "
+                      f"资产 {_fmt_money(balance)} / 负债 {_fmt_money(liability)}")
+    except Exception as e:
+        console.print(f"[red]✗[/red] {e}")
+
+
+@snapshot.command("list")
+@click.option("-n", "--months", type=int, default=6, show_default=True, help="最近 N 个月")
+@click.option("-a", "--account", default=None, help="只看某账户的快照")
+def snapshot_list(months, account):
+    """列出最近几个月的资产快照"""
+    snaps = models.list_snapshots(months, account)
+    if not snaps:
+        console.print(f"[yellow]最近 {months} 个月没有快照记录[/yellow]")
+        return
+    table = Table(title=f"📸 最近 {months} 个月资产快照（共 {len(snaps)} 条）")
+    table.add_column("ID", justify="right", style="cyan")
+    table.add_column("日期", style="magenta")
+    table.add_column("账户", style="blue")
+    table.add_column("余额/资产", justify="right")
+    table.add_column("负债", justify="right", style="red")
+    table.add_column("净")
+    table.add_column("备注")
+    for s in snaps:
+        who = s["account_name"] or "整体"
+        net = s["balance"] - s["liability"]
+        table.add_row(
+            str(s["id"]), s["date"], who,
+            _fmt_money(s["balance"]),
+            _fmt_money(s["liability"]) if s["liability"] else "-",
+            _fmt_money(net),
+            s.get("note") or "",
+        )
+    console.print(table)
+
+
+# ============================================================
+# report yoy: 年度同比
+# ============================================================
+@report.command("yoy")
+@click.option("-y", "--year", type=int, default=None, help="年份，默认今年")
+@click.option("-o", "--output", default=None, help="导出 CSV/JSON")
+def report_yoy(year, output):
+    """年度同比：今年每月 vs 去年同月 + 分类结构变化"""
+    data = models.get_yearly_yoy(year)
+    y = data["year"]
+    py = data["prev_year"]
+
+    # 月度同比表
+    table = Table(title=f"📊 {y} vs {py} 月度同比")
+    table.add_column("月份", justify="center", style="cyan")
+    for col in ("收入", "支出", "净结余"):
+        table.add_column(f"{y} {col}", justify="right")
+        table.add_column(f"{py} {col}", justify="right", style="dim")
+        table.add_column("增减", justify="right")
+        table.add_column("同比", justify="right")
+    for m in data["months"]:
+        def _fmt_yoy(row, key):
+            delta_key = key + "_delta"
+            yoy_key = key + "_yoy"
+            delta = row[delta_key]
+            yoy = row[yoy_key]
+            if delta is None or abs(delta) < 0.005:
+                return "-", "-"
+            s = _fmt_amount(delta, "income" if delta > 0 else "expense")
+            if yoy is None:
+                return s, "-"
+            if yoy > 0:
+                return s, f"[green]+{yoy:.1f}%[/green]"
+            return s, f"[red]{yoy:.1f}%[/red]"
+        inc_d, inc_y = _fmt_yoy(m, "income")
+        exp_d, exp_y = _fmt_yoy(m, "expense")
+        net_d, net_y = _fmt_yoy(m, "net")
+        table.add_row(
+            f"{m['month']}月",
+            _fmt_money(m["income"]), _fmt_money(m["income_prev"]), inc_d, inc_y,
+            _fmt_amount(m["expense"], "expense"), _fmt_amount(m["expense_prev"], "expense"), exp_d, exp_y,
+            _fmt_money(m["net"]), _fmt_money(m["net_prev"]), net_d, net_y,
+        )
+    console.print(table)
+
+    # 分类结构变化
+    cats = data["category_changes"]
+    if cats:
+        table2 = Table(title=f"📊 {y} vs {py} 分类结构变化（按占比差排序）")
+        table2.add_column("分类", style="cyan")
+        table2.add_column("类型", justify="center")
+        table2.add_column(f"{y} 金额", justify="right")
+        table2.add_column(f"{py} 金额", justify="right", style="dim")
+        table2.add_column("增减", justify="right")
+        table2.add_column(f"{y} 占比", justify="right")
+        table2.add_column(f"{py} 占比", justify="right", style="dim")
+        table2.add_column("占比差", justify="right")
+        for c in cats[:30]:
+            delta = c["delta"]
+            delta_s = _fmt_amount(abs(delta), "income" if delta > 0 else "expense") if abs(delta) > 0.005 else "-"
+            share_delta = c["share_delta"]
+            if abs(share_delta) > 0.5:
+                share_s = f"[green]+{share_delta:+.1f}%[/green]" if share_delta > 0 else f"[red]{share_delta:+.1f}%[/red]"
+            else:
+                share_s = f"{share_delta:+.1f}%"
+            table2.add_row(
+                c["name"],
+                "[green]收入[/green]" if c["type"] == "income" else "[red]支出[/red]",
+                _fmt_money(c["total"]) if c["total"] > 0 else "-",
+                _fmt_money(c["total_prev"]) if c["total_prev"] > 0 else "-",
+                delta_s,
+                f"{c['share']:.1f}%" if c["share"] > 0 else "-",
+                f"{c['share_prev']:.1f}%" if c["share_prev"] > 0 else "-",
+                share_s,
+            )
+        console.print(table2)
+
+    if output:
+        if output.lower().endswith(".json"):
+            models.export_report_json(output, data)
+        else:
+            month_fields = [
+                "row_type", "month", "category", "type",
+                "income", "income_prev", "income_delta", "income_yoy",
+                "expense", "expense_prev", "expense_delta", "expense_yoy",
+                "net", "net_prev", "net_delta", "net_yoy",
+                "total", "total_prev", "delta", "share", "share_prev", "share_delta",
+            ]
+            rows = []
+            for m in data["months"]:
+                rows.append({
+                    "row_type": "month",
+                    "month": m["month"], "category": "", "type": "",
+                    "income": round(m["income"], 2),
+                    "income_prev": round(m["income_prev"], 2),
+                    "income_delta": round(m["income_delta"], 2),
+                    "income_yoy": round(m["income_yoy"], 2) if m["income_yoy"] is not None else "",
+                    "expense": round(m["expense"], 2),
+                    "expense_prev": round(m["expense_prev"], 2),
+                    "expense_delta": round(m["expense_delta"], 2),
+                    "expense_yoy": round(m["expense_yoy"], 2) if m["expense_yoy"] is not None else "",
+                    "net": round(m["net"], 2),
+                    "net_prev": round(m["net_prev"], 2),
+                    "net_delta": round(m["net_delta"], 2),
+                    "net_yoy": round(m["net_yoy"], 2) if m["net_yoy"] is not None else "",
+                    "total": "", "total_prev": "", "delta": "",
+                    "share": "", "share_prev": "", "share_delta": "",
+                })
+            for c in data["category_changes"]:
+                rows.append({
+                    "row_type": "category",
+                    "month": "", "category": c["name"], "type": c["type"],
+                    "income": "", "income_prev": "", "income_delta": "", "income_yoy": "",
+                    "expense": "", "expense_prev": "", "expense_delta": "", "expense_yoy": "",
+                    "net": "", "net_prev": "", "net_delta": "", "net_yoy": "",
+                    "total": round(c["total"], 2),
+                    "total_prev": round(c["total_prev"], 2),
+                    "delta": round(c["delta"], 2),
+                    "share": round(c["share"], 2),
+                    "share_prev": round(c["share_prev"], 2),
+                    "share_delta": round(c["share_delta"], 2),
+                })
+            with open(output, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=month_fields)
+                writer.writeheader()
+                writer.writerows(rows)
+        console.print(f"[green]✓[/green] 已导出同比报表到 {output}")
+
+
 @cli.command("info")
 def info():
     """显示工具信息"""
     console.print(Panel(
-        f"[bold]mny[/bold] - 命令行记账理财工具 v0.4.0\n\n"
+        f"[bold]mny[/bold] - 命令行记账理财工具 v0.5.0\n\n"
         f"数据库路径: [cyan]{DB_PATH}[/cyan]\n"
         f"使用 '[bold]mny --help[/bold]' 查看全部命令\n"
-        f"核心功能: transfer 转账 / recurring 定期记账 / reconcile 对账(含余额校准+重复识别) /\n"
-        f"          budget 多维度滚动预算(支持上月结转) / backup 备份 / export 导出 / trend 趋势视图",
+        f"核心功能: transfer 转账 / recurring 定期记账 / reconcile 对账(含余额校准+编号选择补记) /\n"
+        f"          snapshot 净资产快照 / budget 多维度链式滚动预算 / report yoy 年度同比 /\n"
+        f"          backup 备份 / export 导出 / trend 趋势视图",
         title="💰 mny",
         border_style="green",
     ))

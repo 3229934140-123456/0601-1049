@@ -1695,3 +1695,340 @@ def get_trend(
         "period_expense": [period_expense[p] for p in periods],
     }
 
+
+# ================================
+# 净资产快照 Net Worth Snapshots
+# ================================
+def add_snapshot(date_str: str, account: Optional[str | int],
+                 balance: float, liability: float = 0.0,
+                 note: Optional[str] = None) -> int:
+    """记录某个账户在特定日期的余额/负债快照。account=None 表示整体净资产快照"""
+    datetime.strptime(date_str, "%Y-%m-%d")
+    account_id = None
+    if account is not None:
+        acc = get_account(account)
+        if not acc:
+            raise ValueError(f"账户不存在: {account}")
+        account_id = acc["id"]
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO net_worth_snapshots (date, account_id, balance, liability, note)
+               VALUES (?, ?, ?, ?, ?)""",
+            (date_str, account_id, balance, liability, note),
+        )
+        return cur.lastrowid
+
+
+def list_snapshots(months: int = 6,
+                   account: Optional[str | int] = None) -> List[Dict[str, Any]]:
+    """最近 N 个月的资产快照"""
+    start = _first_day_n_months_ago(months)
+    with get_conn() as conn:
+        sql = """
+            SELECT n.id, n.date, n.balance, n.liability, n.note,
+                   a.name AS account_name
+            FROM net_worth_snapshots n
+            LEFT JOIN accounts a ON a.id = n.account_id
+            WHERE n.date >= ?
+        """
+        params: list = [start.isoformat()]
+        if account is not None:
+            if isinstance(account, int) or (isinstance(account, str) and account.isdigit()):
+                sql += " AND n.account_id = ?"
+                params.append(int(account))
+            else:
+                sql += " AND a.name = ?"
+                params.append(account)
+        sql += " ORDER BY n.date DESC, n.id DESC"
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_current_net_worth() -> Dict[str, Any]:
+    """从 accounts 表实时计算当前净资产（账户余额之和）"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, type, balance FROM accounts ORDER BY id"
+        ).fetchall()
+        accounts = [dict(r) for r in rows]
+        total_assets = sum(a["balance"] for a in accounts)
+        # 从快照里读最新整体负债（如有）
+        latest_liab = conn.execute(
+            "SELECT COALESCE(SUM(liability),0) AS l FROM net_worth_snapshots "
+            "WHERE account_id IS NULL ORDER BY date DESC, id DESC LIMIT 1"
+        ).fetchone()
+        total_liability = latest_liab["l"] if latest_liab else 0.0
+    return {
+        "accounts": accounts,
+        "total_assets": total_assets,
+        "total_liability": total_liability,
+        "net_worth": total_assets - total_liability,
+    }
+
+
+def get_net_worth_trend(months: int = 6) -> Dict[str, Any]:
+    """最近 N 个月净资产趋势：每月取该月所有快照的最后一天"""
+    start = _first_day_n_months_ago(months)
+    end_date = date.today()
+
+    periods = []
+    cursor = start
+    while (cursor.year, cursor.month) <= (end_date.year, end_date.month):
+        periods.append(f"{cursor.year:04d}-{cursor.month:02d}")
+        if cursor.month == 12:
+            cursor = date(cursor.year + 1, 1, 1)
+        else:
+            cursor = date(cursor.year, cursor.month + 1, 1)
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT n.date, n.balance, n.liability, a.name AS account_name
+               FROM net_worth_snapshots n
+               LEFT JOIN accounts a ON a.id = n.account_id
+               WHERE n.date >= ?
+               ORDER BY n.date DESC""",
+            (start.isoformat(),),
+        ).fetchall()
+
+    monthly: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        p = r["date"][:7]
+        if p not in periods:
+            continue
+        if p not in monthly:
+            monthly[p] = {"balance": 0.0, "liability": 0.0, "account_snaps": {}}
+        key = r["account_name"] or "__total__"
+        monthly[p]["account_snaps"][key] = {
+            "balance": r["balance"], "liability": r["liability"]
+        }
+
+    # 没有快照的月份尝试从 transactions 估算（账户余额累计变化）
+    period_idx = {p: i for i, p in enumerate(periods)}
+    balances_assets = [None] * len(periods)
+    balances_liab = [None] * len(periods)
+
+    # 先填入快照
+    for p, v in monthly.items():
+        idx = period_idx[p]
+        # 如果 __total__ 快照存在，直接用
+        if "__total__" in v["account_snaps"]:
+            balances_assets[idx] = v["account_snaps"]["__total__"]["balance"]
+            balances_liab[idx] = v["account_snaps"]["__total__"]["liability"]
+        else:
+            # 汇总所有账户快照
+            total_bal = sum(a["balance"] for a in v["account_snaps"].values())
+            total_liab = sum(a["liability"] for a in v["account_snaps"].values())
+            if total_bal > 0 or total_liab > 0:
+                balances_assets[idx] = total_bal
+                balances_liab[idx] = total_liab
+
+    # 用当前净资产兜底最后一个月
+    cur = get_current_net_worth()
+    if balances_assets[-1] is None:
+        balances_assets[-1] = cur["total_assets"]
+    if balances_liab[-1] is None:
+        balances_liab[-1] = cur["total_liability"]
+
+    # 向前回溯：某月没快照，用后一月扣掉该月净结余
+    for i in range(len(periods) - 2, -1, -1):
+        if balances_assets[i] is not None:
+            continue
+        # 当月（periods[i]）净结余 = 当月收入 - 当月支出
+        py, pm = map(int, periods[i].split("-"))
+        summary = get_monthly_summary(py, pm)
+        net = summary["income"] - summary["expense"]
+        # 当月末 = 下月初；下月初资产 = 当月末资产 + 净结余（简化）
+        if balances_assets[i + 1] is not None:
+            balances_assets[i] = balances_assets[i + 1] - net
+            balances_liab[i] = balances_liab[i + 1]
+
+    return {
+        "periods": periods,
+        "assets": balances_assets,
+        "liabilities": balances_liab,
+        "net_worth": [(balances_assets[i] or 0) - (balances_liab[i] or 0) if balances_assets[i] is not None else None
+                      for i in range(len(periods))],
+        "current": cur,
+    }
+
+
+# ================================
+# 预算多月连续结转
+# ================================
+def refresh_carry_over_chain(year: int, month: int) -> int:
+    """
+    从最早有预算记录的月份开始，链式滚动计算每月 carry_over：
+    carry_over(本月) = carry_over(上月) + amount(上月) - spent(上月)
+    一直算到指定 (year, month) 前一月为止，再写入本月 budgets 的 carry_over。
+    """
+    with get_conn() as conn:
+        min_row = conn.execute(
+            "SELECT MIN(year) AS y, MIN(month) AS m FROM budgets"
+        ).fetchone()
+        if not min_row or min_row["y"] is None:
+            return 0
+
+    # 建立 (y,m) -> set of (scope, scope_key)
+    cur_y, cur_m = min_row["y"], min_row["m"]
+    # 从 min 月份逐步推到 target 前一月
+    target = (year, month)
+    updated = 0
+    while (cur_y, cur_m) < target:
+        # 上月 carry_over = 更早月份累积结余，此处我们只从 min 开始
+        ny, nm = (cur_y, cur_m + 1) if cur_m < 12 else (cur_y + 1, 1)
+        # 对 (ny, nm) 月的所有 budget 项：carry_over = 上月 (cur_y,cur_m) 的 amount - spent + 上月 carry_over
+        # 先找出 (ny, nm) 月有哪些 scope 项
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM budgets WHERE year=? AND month=?", (ny, nm)
+            ).fetchall()
+            for r in rows:
+                # 先看上月这个 scope 项有没有 budget
+                prev = conn.execute(
+                    "SELECT * FROM budgets WHERE scope=? AND scope_key=? AND year=? AND month=?",
+                    (r["scope"], r["scope_key"], cur_y, cur_m),
+                ).fetchone()
+                chain_co = 0.0
+                if prev:
+                    prev_co = prev["carry_over"] or 0.0
+                    prev_spent = _calc_scope_spent(conn, r["scope"], r["scope_key"], cur_y, cur_m)
+                    chain_co = prev_co + prev["amount"] - prev_spent
+                # 写入 (ny, nm) 的 carry_over
+                conn.execute(
+                    "UPDATE budgets SET carry_over=? WHERE id=?",
+                    (round(chain_co, 2), r["id"]),
+                )
+                updated += 1
+        cur_y, cur_m = ny, nm
+    return updated
+
+
+# 覆盖旧的 refresh_carry_over，默认走链式
+def refresh_carry_over(year: int, month: int) -> int:
+    return refresh_carry_over_chain(year, month)
+
+
+# ================================
+# 重复流水识别（三类互斥版）
+# ================================
+def find_duplicate_transactions_exclusive(
+    bank_records: List[Dict[str, Any]],
+    account: str | int,
+) -> Dict[str, Any]:
+    """
+    三类互斥：两边都重复的 key 不再出现在银行重复 / mny 重复里。
+    """
+    full = find_duplicate_transactions(bank_records, account)
+    both_keys = {d["key"] for d in full["duplicates_both"]}
+    dup_bank = [d for d in full["duplicates_in_bank"] if d["key"] not in both_keys]
+    dup_mny = [d for d in full["duplicates_in_mny"] if d["key"] not in both_keys]
+    return {
+        "duplicates_in_bank": dup_bank,
+        "duplicates_in_mny": dup_mny,
+        "duplicates_both": full["duplicates_both"],
+    }
+
+
+# ================================
+# 年度同比 & 分类结构变化
+# ================================
+def get_yearly_yoy(year: Optional[int] = None) -> Dict[str, Any]:
+    """
+    返回指定年份（默认今年）每月 vs 去年同月的收入/支出/净结余同比，
+    以及分类结构的同比变化。
+    """
+    if year is None:
+        year = date.today().year
+    prev_year = year - 1
+
+    this_year_months = []
+    for m in range(1, 13):
+        s = get_monthly_summary(year, m)
+        this_year_months.append({
+            "month": m, "income": s["income"], "expense": s["expense"],
+            "net": s["income"] - s["expense"], "by_category": s["by_category"],
+        })
+
+    prev_year_months = []
+    for m in range(1, 13):
+        s = get_monthly_summary(prev_year, m)
+        prev_year_months.append({
+            "month": m, "income": s["income"], "expense": s["expense"],
+            "net": s["income"] - s["expense"], "by_category": s["by_category"],
+        })
+
+    yoy_months = []
+    for m in range(1, 12 + 1):
+        t = this_year_months[m - 1]
+        p = prev_year_months[m - 1]
+        def _delta(curr, prev):
+            if abs(prev) < 0.005:
+                return None
+            return (curr - prev) / prev * 100
+        yoy_months.append({
+            "month": m,
+            "income": t["income"], "income_prev": p["income"],
+            "income_delta": t["income"] - p["income"],
+            "income_yoy": _delta(t["income"], p["income"]),
+            "expense": t["expense"], "expense_prev": p["expense"],
+            "expense_delta": t["expense"] - p["expense"],
+            "expense_yoy": _delta(t["expense"], p["expense"]),
+            "net": t["net"], "net_prev": p["net"],
+            "net_delta": t["net"] - p["net"],
+            "net_yoy": _delta(t["net"], p["net"]),
+        })
+
+    # 分类结构变化：全年聚合
+    def _agg_cats(months_data):
+        cats: Dict[str, Dict[str, float]] = {}
+        for md in months_data:
+            for c in md["by_category"]:
+                key = f"{c['type']}:{c['category']}"
+                cats.setdefault(key, {"name": c["category"], "type": c["type"], "total": 0.0})
+                cats[key]["total"] += c["total"]
+        return list(cats.values())
+
+    this_cats = _agg_cats(this_year_months)
+    prev_cats = _agg_cats(prev_year_months)
+    this_total_income = sum(c["total"] for c in this_cats if c["type"] == "income")
+    this_total_expense = sum(c["total"] for c in this_cats if c["type"] == "expense")
+    prev_total_income = sum(c["total"] for c in prev_cats if c["type"] == "income")
+    prev_total_expense = sum(c["total"] for c in prev_cats if c["type"] == "expense")
+
+    prev_map = {f"{c['type']}:{c['name']}": c for c in prev_cats}
+    cat_change = []
+    for c in this_cats:
+        key = f"{c['type']}:{c['name']}"
+        pc = prev_map.get(key, {"total": 0.0})
+        total_this = this_total_income if c["type"] == "income" else this_total_expense
+        total_prev = prev_total_income if c["type"] == "income" else prev_total_expense
+        share_this = (c["total"] / total_this * 100) if total_this > 0 else 0.0
+        share_prev = (pc["total"] / total_prev * 100) if total_prev > 0 else 0.0
+        cat_change.append({
+            "name": c["name"], "type": c["type"],
+            "total": c["total"], "total_prev": pc["total"],
+            "delta": c["total"] - pc["total"],
+            "share": share_this, "share_prev": share_prev,
+            "share_delta": share_this - share_prev,
+        })
+    # 去年有今年没有的分类
+    this_map = {f"{c['type']}:{c['name']}": c for c in this_cats}
+    for key, pc in prev_map.items():
+        if key not in this_map:
+            total_prev = prev_total_income if pc["type"] == "income" else prev_total_expense
+            share_prev = (pc["total"] / total_prev * 100) if total_prev > 0 else 0.0
+            cat_change.append({
+                "name": pc["name"], "type": pc["type"],
+                "total": 0.0, "total_prev": pc["total"],
+                "delta": -pc["total"],
+                "share": 0.0, "share_prev": share_prev,
+                "share_delta": -share_prev,
+            })
+
+    return {
+        "year": year, "prev_year": prev_year,
+        "months": yoy_months,
+        "category_changes": sorted(cat_change, key=lambda x: -abs(x["share_delta"])),
+    }
+
+

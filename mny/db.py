@@ -139,6 +139,19 @@ CREATE TABLE IF NOT EXISTS recurring (
     FOREIGN KEY (category_id) REFERENCES categories(id)
 );
 CREATE INDEX IF NOT EXISTS idx_recurring_next ON recurring(next_date);
+
+CREATE TABLE IF NOT EXISTS net_worth_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    account_id INTEGER,
+    balance REAL NOT NULL,
+    liability REAL DEFAULT 0,
+    note TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nw_date ON net_worth_snapshots(date);
+CREATE INDEX IF NOT EXISTS idx_nw_account ON net_worth_snapshots(account_id);
 """
 
 DEFAULT_ACCOUNTS = [
