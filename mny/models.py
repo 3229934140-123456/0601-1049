@@ -1363,3 +1363,335 @@ def apply_reconcile(missing_records: List[Dict[str, Any]],
             skipped += 1
             errors.append(f"{rec.get('date')} {rec.get('amount')}: {e}")
     return added, skipped, errors
+
+
+# ================================
+# Reconcile: balance 余额校准 & 重复识别
+# ================================
+def find_duplicate_transactions(
+    bank_records: List[Dict[str, Any]],
+    account: str | int,
+) -> Dict[str, Any]:
+    """
+    分别检测：
+    - duplicates_in_bank: 银行流水里自身重复
+    - duplicates_in_mny: mny 内部重复
+    - duplicates_both: 两边都重复的重复组
+    按 (type, date, amount, note) 聚合。
+    返回 {duplicates_in_bank, duplicates_in_mny, duplicates_both}
+    每一项都是 list of dict: {key, count, items:[记录1, 记录2...]}
+    """
+    acc = get_account(account)
+    if not acc:
+        raise ValueError(f"账户不存在: {account}")
+
+    def _group(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+        for r in records:
+            key = f"{r.get('type')}|{r.get('date')}|{round(float(r.get('amount',0)),2)}|{r.get('note','')}"
+            buckets.setdefault(key, []).append(r)
+        return buckets
+
+    cleaned_bank: List[Dict[str, Any]] = []
+    for rec in bank_records:
+        try:
+            amount = float(rec.get("amount", 0))
+        except (TypeError, ValueError):
+            continue
+        if amount == 0:
+            continue
+        if amount < 0:
+            tx_type = rec.get("type") or "expense"
+            amount = abs(amount)
+        else:
+            tx_type = rec.get("type") or "income"
+        cleaned_bank.append({
+            "type": tx_type, "amount": amount,
+            "date": (rec.get("date") or "").strip() or date.today().isoformat(),
+            "note": (rec.get("note") or "").strip(),
+            "category": (rec.get("category") or "").strip(),
+            "raw": rec,
+        })
+
+    with get_conn() as conn:
+        mny_rows = [dict(r) for r in conn.execute(
+            """SELECT t.id, t.type, t.amount, t.date, COALESCE(t.note,'') AS note,
+                      c.name AS category
+               FROM transactions t
+               JOIN categories c ON c.id = t.category_id
+               WHERE t.account_id = ?
+               ORDER BY t.date, t.id""",
+            (acc["id"],),
+        ).fetchall()]
+
+    bank_groups = _group(cleaned_bank)
+    mny_groups = _group(mny_rows)
+
+    dup_in_bank = []
+    for k, items in bank_groups.items():
+        if len(items) > 1:
+            dup_in_bank.append({"key": k, "count": len(items), "items": items})
+
+    dup_in_mny = []
+    for k, items in mny_groups.items():
+        if len(items) > 1:
+            dup_in_mny.append({"key": k, "count": len(items), "items": items})
+
+    dup_both = []
+    for k in bank_groups:
+        if len(bank_groups[k]) > 1 and len(mny_groups.get(k, [])) > 1:
+            dup_both.append({
+                "key": k,
+                "bank_count": len(bank_groups[k]),
+                "mny_count": len(mny_groups[k]),
+                "bank_items": bank_groups[k],
+                "mny_items": mny_groups[k],
+            })
+
+    return {
+        "duplicates_in_bank": dup_in_bank,
+        "duplicates_in_mny": dup_in_mny,
+        "duplicates_both": dup_both,
+    }
+
+
+def delete_duplicate_mny_transaction(tx_id: int) -> bool:
+    """删除 mny 中一条重复的交易（同时回滚账户余额）"""
+    tx = get_transaction(tx_id)
+    if not tx:
+        return False
+    return delete_transaction(tx_id)
+
+
+def reconcile_with_balance(
+    bank_records: List[Dict[str, Any]],
+    account: str | int,
+    bank_balance: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    在 reconcile_transactions 基础上加上外部余额对比，返回差额和调整建议。
+    """
+    result = reconcile_transactions(bank_records, account)
+    acc = get_account(account)
+    result["bank_balance"] = bank_balance
+    if bank_balance is not None and acc is not None:
+        diff = bank_balance - acc["balance"]
+        result["diff"] = diff
+        result["diff_abs"] = abs(diff)
+    return result
+
+
+def create_balance_adjustment(
+    account: str | int,
+    target_balance: float,
+    note: Optional[str] = None,
+    tx_date: Optional[str] = None,
+) -> int:
+    """
+    生成一条余额校准记录：让 mny 余额对齐到目标余额，
+    根据差额作为"其他收入/其他支出"记录一笔。
+    """
+    acc = get_account(account)
+    if not acc:
+        raise ValueError(f"账户不存在: {account}")
+    diff = target_balance - acc["balance"]
+    if abs(diff) < 0.005:
+        raise ValueError("账户余额与目标余额一致，无需校准")
+    tx_type = "income" if diff > 0 else "expense"
+    category = "其他收入" if diff > 0 else "其他支出"
+    if not note:
+        note = f"余额校准(对账差异)"
+    return add_transaction(
+        tx_type=tx_type, amount=abs(diff), account=acc["name"],
+        category=category, tx_date=tx_date, note=note,
+    )
+
+
+# ================================
+# Budget 滚动预算 & 结转
+# ================================
+def _prev_month(year: int, month: int) -> Tuple[int, int]:
+    if month == 1:
+        return year - 1, 12
+    return year, month - 1
+
+
+def compute_carry_over(year: int, month: int, scope: str, scope_key: str) -> float:
+    """计算上月该维度的结余（正=结转余额，负=超支）"""
+    py, pm = _prev_month(year, month)
+    prev_budgets = list_budgets(py, pm)
+    for b in prev_budgets:
+        if b["scope"] == scope and b["scope_key"] == scope_key:
+            # 上月 剩余 = 上月预算 - 上月已用
+            return b["amount"] - b["spent"]
+    return 0.0
+
+
+def refresh_carry_over(year: int, month: int) -> int:
+    """根据上月结余计算本月所有 budget 的 carry_over 字段"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM budgets WHERE year=? AND month=?",
+            (year, month),
+        ).fetchall()
+        updated = 0
+        for r in rows:
+            co = compute_carry_over(year, month, r["scope"], r["scope_key"])
+            conn.execute(
+                "UPDATE budgets SET carry_over=? WHERE id=?",
+                (co, r["id"]),
+            )
+            updated += 1
+        return updated
+
+
+def list_budgets_with_carry(year: int, month: int) -> List[Dict[str, Any]]:
+    """含结转版本：本月预算 + 上月结转 = 实际可用"""
+    budgets = list_budgets(year, month)
+    with get_conn() as conn:
+        rows = {r["id"]: r["carry_over"] or 0
+                for r in conn.execute(
+                    "SELECT id, carry_over FROM budgets WHERE year=? AND month=?",
+                    (year, month),
+                ).fetchall()}
+    results = []
+    for b in budgets:
+        carry = rows.get(b["id"], 0.0)
+        effective_budget = b["amount"] + carry
+        results.append({
+            **b,
+            "carry_over": carry,
+            "effective_budget": effective_budget,
+            "available_effective": effective_budget - b["spent"] - b["recurring_pending"],
+        })
+    return results
+
+
+def get_budget_analysis_with_carry(year: int, month: int) -> Dict[str, Any]:
+    today = date.today()
+    budgets = list_budgets_with_carry(year, month)
+    _, last_day = calendar.monthrange(year, month)
+    days_in_month = last_day
+    current_day = min(today.day, last_day) if today.year == year and today.month == month else last_day
+    remaining_days = max(days_in_month - current_day, 0)
+    results = []
+    for b in budgets:
+        spent = b["spent"]
+        avg = spent / current_day if current_day > 0 else 0
+        projected = spent + avg * remaining_days
+        will_overrun = projected > b["effective_budget"]
+        results.append({
+            **b,
+            "days_passed": current_day,
+            "days_remaining": remaining_days,
+            "daily_avg": avg,
+            "projected_total": projected,
+            "projected_overrun": max(projected - b["effective_budget"], 0),
+            "will_overrun": will_overrun,
+        })
+    return {
+        "year": year,
+        "month": month,
+        "days_passed": current_day,
+        "days_remaining": remaining_days,
+        "budgets": results,
+    }
+
+
+# ================================
+# Trend 趋势
+# ================================
+def _first_day_n_months_ago(n: int) -> date:
+    today = date.today()
+    m = today.month - n + 1
+    y = today.year
+    while m <= 0:
+        m += 12
+        y -= 1
+    return date(y, m, 1)
+
+
+def get_trend(
+    months: int = 3,
+    scope: str = "category",
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    最近 N 个月按维度聚合。
+    scope ∈ {category, account, tag, project}
+    返回 {periods: ["2026-04, 2026-05, 2026-06],
+          series: [{name, income:[...], expense:[...]} }
+    """
+    if scope not in ("category", "account", "tag", "project"):
+        raise ValueError(f"无效趋势维度: {scope}")
+    start = _first_day_n_months_ago(months)
+    end_date = date.today()
+
+    periods = []
+    cursor = start
+    while (cursor.year, cursor.month) <= (end_date.year, end_date.month):
+        periods.append(f"{cursor.year:04d}-{cursor.month:02d}")
+        if cursor.month == 12:
+            cursor = date(cursor.year + 1, 1, 1)
+        else:
+            cursor = date(cursor.year, cursor.month + 1, 1)
+
+    period_idx = {p: i for i, p in enumerate(periods)}
+    period_income = {p: 0.0 for p in periods}
+    period_expense = {p: 0.0 for p in periods}
+
+    with get_conn() as conn:
+        sql = f"""
+            SELECT t.id, t.type, t.amount, t.date,
+        """
+        if scope == "category":
+            sql += " c.name AS key_name FROM transactions t JOIN categories c ON c.id = t.category_id "
+        elif scope == "account":
+            sql += " a.name AS key_name FROM transactions t JOIN accounts a ON a.id = t.account_id "
+        elif scope == "tag":
+            sql += """ tg.name AS key_name FROM transactions t
+                       JOIN transaction_tags tt ON tt.transaction_id = t.id
+                       JOIN tags tg ON tg.id = tt.tag_id """
+        elif scope == "project":
+            sql += """ p.name AS key_name FROM transactions t
+                       JOIN transaction_projects tp ON tp.transaction_id = t.id
+                       JOIN projects p ON p.id = tp.project_id """
+
+        sql += " WHERE t.date >= ? AND t.date < ?"
+        params: list = [start.isoformat(), (end_date + timedelta(days=1)).isoformat()]
+        if scope_key:
+            sql += " AND key_name = ?" if scope in ("category", "account", "tag", "project") else ""
+            # 上面不行，scope 用不同的名字，改一下：
+        rows = conn.execute(sql.replace(" AND key_name = ?", ""), params).fetchall()
+
+    series_map: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        p = r["date"][:7]
+        if p not in period_idx:
+            continue
+        name = r["key_name"]
+        if scope_key and name != scope_key:
+            continue
+        if name not in series_map:
+            series_map[name] = {
+                "name": name,
+                "income": [0.0] * len(periods),
+                "expense": [0.0] * len(periods),
+            }
+        s = series_map[name]
+        if r["type"] == "income":
+            s["income"][period_idx[p]] += r["amount"]
+            period_income[p] += r["amount"]
+        else:
+            s["expense"][period_idx[p]] += r["amount"]
+            period_expense[p] += r["amount"]
+
+    return {
+        "scope": scope,
+        "months": months,
+        "periods": periods,
+        "series": list(series_map.values()),
+        "period_income": [period_income[p] for p in periods],
+        "period_expense": [period_expense[p] for p in periods],
+    }
+

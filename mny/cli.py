@@ -173,7 +173,7 @@ def transfer_list(start, end, account, output):
 def transfer_delete(tf_id, yes):
     """删除转账记录（会反向恢复余额）"""
     if not yes:
-        if not Confirm.confirm(f"确认删除转账 #{tf_id} ？（会恢复两账户余额）", default=False):
+        if not Confirm.ask(f"确认删除转账 #{tf_id} ？（会恢复两账户余额）", default=False):
             return
     try:
         models.delete_transfer(tf_id)
@@ -299,7 +299,7 @@ def recurring_toggle(r_id, active):
 def recurring_delete(r_id, yes):
     """删除定期记账规则（不影响已入账记录）"""
     if not yes:
-        if not Confirm.confirm(f"确认删除定期记账规则 #{r_id} ？", default=False):
+        if not Confirm.ask(f"确认删除定期记账规则 #{r_id} ？", default=False):
             return
     try:
         models.delete_recurring(r_id)
@@ -468,7 +468,7 @@ def edit_delete(tx_id, yes):
         return
     _print_tx_detail(tx)
     if not yes:
-        if not Confirm.confirm("确认删除这条记录？", default=False):
+        if not Confirm.ask("确认删除这条记录？", default=False):
             console.print("[yellow]已取消[/yellow]")
             return
     try:
@@ -526,23 +526,39 @@ def budget_set(scope, key, amount, year, month):
         month = today.month
     try:
         models.set_budget(scope, key, year, month, amount)
+        models.refresh_carry_over(year, month)
         console.print(f"[green]✓[/green] 已设置 {year}-{month:02d} {scope}={key} 预算: ¥{amount:,.2f}")
     except ValueError as e:
         console.print(f"[red]✗[/red] {e}")
+
+
+@budget.command("refresh")
+@click.option("-y", "--year", type=int, default=None, help="年份，默认今年")
+@click.option("-m", "--month", type=int, default=None, help="月份，默认本月")
+def budget_refresh(year, month):
+    """刷新本月所有预算的上月结转字段"""
+    today = date.today()
+    if year is None:
+        year = today.year
+    if month is None:
+        month = today.month
+    updated = models.refresh_carry_over(year, month)
+    console.print(f"[green]✓[/green] 刷新完成，更新了 {updated} 条预算的上月结转")
 
 
 @budget.command("list")
 @click.option("-y", "--year", type=int, default=None, help="年份，默认今年")
 @click.option("-m", "--month", type=int, default=None, help="月份，默认本月")
 def budget_list(year, month):
-    """查看月度预算及使用情况、月底预测、固定支出占用"""
+    """查看月度预算及使用情况、月底预测、固定支出占用（含上月结转）"""
     today = date.today()
     if year is None:
         year = today.year
     if month is None:
         month = today.month
 
-    analysis = models.get_budget_analysis(year, month)
+    models.refresh_carry_over(year, month)
+    analysis = models.get_budget_analysis_with_carry(year, month)
     budgets = analysis["budgets"]
     if not budgets:
         console.print(f"[yellow]{year}-{month:02d} 暂无预算设置[/yellow]")
@@ -551,16 +567,19 @@ def budget_list(year, month):
     table = Table(title=f"{year}-{month:02d} 预算概览（已过 {analysis['days_passed']} 天，剩 {analysis['days_remaining']} 天）")
     table.add_column("维度", style="cyan")
     table.add_column("对象", style="yellow")
-    table.add_column("预算", justify="right", style="cyan")
+    table.add_column("本月预算", justify="right", style="cyan")
+    table.add_column("上月结转", justify="right", style="magenta")
+    table.add_column("实际可用", justify="right")
     table.add_column("已用", justify="right")
     table.add_column("待入账", justify="right", style="magenta")
-    table.add_column("可用", justify="right")
+    table.add_column("剩余", justify="right")
     table.add_column("日均", justify="right", style="dim")
     table.add_column("月底预测", justify="right")
     table.add_column("状态", justify="center")
 
     for b in budgets:
-        pct = (b["spent"] / b["amount"] * 100) if b["amount"] > 0 else 0
+        effective = b["effective_budget"]
+        pct = (b["spent"] / effective * 100) if effective > 0 else 0
         if b["will_overrun"]:
             status = f"[red]预计超支[/red]"
             remaining_style = "red"
@@ -574,6 +593,7 @@ def budget_list(year, month):
             status = f"[green]正常 {pct:.0f}%[/green]"
             remaining_style = "green"
 
+        carry_style = "green" if b["carry_over"] >= 0 else "red"
         predicted_str = _fmt_money(b["projected_total"])
         if b["will_overrun"]:
             predicted_str += f" [red](超 ¥{b['projected_overrun']:,.2f})[/red]"
@@ -581,9 +601,11 @@ def budget_list(year, month):
         table.add_row(
             b["scope"], b["scope_key"],
             f"¥{b['amount']:,.2f}",
+            f"[{carry_style}]¥{b['carry_over']:+,.2f}[/{carry_style}]",
+            f"¥{effective:,.2f}",
             f"¥{b['spent']:,.2f}",
             f"¥{b['recurring_pending']:,.2f}" if b["recurring_pending"] > 0 else "-",
-            f"[{remaining_style}]¥{b['available']:,.2f}[/{remaining_style}]",
+            f"[{remaining_style}]¥{b['available_effective']:,.2f}[/{remaining_style}]",
             f"¥{b['daily_avg']:,.2f}",
             predicted_str,
             status,
@@ -645,28 +667,34 @@ def _show_pending_recurring(year, month):
 
 
 def _show_budget_analysis(year, month):
-    analysis = models.get_budget_analysis(year, month)
+    analysis = models.get_budget_analysis_with_carry(year, month)
     budgets = analysis["budgets"]
     if not budgets:
         return
     table = Table(title=f"🎯 {year}-{month:02d} 预算状态 & 月底预测")
     table.add_column("维度", style="cyan")
     table.add_column("对象", style="yellow")
-    table.add_column("预算", justify="right", style="cyan")
+    table.add_column("本月预算", justify="right", style="cyan")
+    table.add_column("上月结转", justify="right", style="magenta")
+    table.add_column("实际可用", justify="right")
     table.add_column("已用", justify="right")
     table.add_column("固定支出待入账", justify="right", style="magenta")
-    table.add_column("可用", justify="right")
+    table.add_column("剩余", justify="right")
     table.add_column("月底预测", justify="right")
     for b in budgets:
+        carry_style = "green" if b["carry_over"] >= 0 else "red"
         predicted_str = _fmt_money(b["projected_total"])
         if b["will_overrun"]:
             predicted_str += f" [red]超支¥{b['projected_overrun']:,.2f}[/red]"
+        eff_style = "red" if b["available_effective"] < 0 else "green"
         table.add_row(
             b["scope"], b["scope_key"],
             f"¥{b['amount']:,.2f}",
+            f"[{carry_style}]¥{b['carry_over']:+,.2f}[/{carry_style}]",
+            f"¥{b['effective_budget']:,.2f}",
             f"¥{b['spent']:,.2f}",
             f"¥{b['recurring_pending']:,.2f}" if b["recurring_pending"] > 0 else "-",
-            _fmt_money(b["available"]),
+            f"[{eff_style}]¥{b['available_effective']:,.2f}[/{eff_style}]",
             predicted_str,
         )
     console.print(table)
@@ -701,6 +729,7 @@ def report_monthly(year, month, output):
     if month is None:
         month = today.month
 
+    models.refresh_carry_over(year, month)
     data = models.get_monthly_summary(year, month)
     console.print(Panel(
         f"报告周期: [bold]{year}-{month:02d}[/bold]\n"
@@ -815,6 +844,100 @@ def report_balance(output):
         console.print(f"[green]✓[/green] 已导出到 {output}")
 
 
+@report.command("trend")
+@click.option("-n", "--months", type=int, default=3, show_default=True, help="最近几个月")
+@click.option("-s", "--scope", type=click.Choice(["category", "account", "tag", "project"]),
+              default="category", show_default=True, help="按什么维度聚合")
+@click.option("-k", "--key", "scope_key", default=None, help="只看某个具体维度值（如 '餐饮'）")
+@click.option("-o", "--output", default=None, help="导出 CSV/JSON")
+def report_trend(months, scope, scope_key, output):
+    """最近 N 个月按分类/账户/标签/项目的收支趋势"""
+    if months < 1:
+        months = 1
+    data = models.get_trend(months=months, scope=scope, scope_key=scope_key)
+    periods = data["periods"]
+    series = data["series"]
+    if not series:
+        console.print(f"[yellow]最近 {months} 个月按 {scope} 维度没有数据[/yellow]")
+        return
+
+    table = Table(title=f"📈 最近 {months} 个月 {scope + ('=' + scope_key if scope_key else '')} 收支趋势")
+    table.add_column(scope, style="cyan")
+    table.add_column("类型", justify="center")
+    for p in periods:
+        table.add_column(p, justify="right")
+    table.add_column("合计", justify="right", style="bold")
+
+    for s in series:
+        incomes = s["income"]
+        expenses = s["expense"]
+        income_total = sum(incomes)
+        expense_total = sum(expenses)
+        if income_total > 0:
+            table.add_row(
+                s["name"], "[green]收入[/green]",
+                *[_fmt_money(x) if x > 0 else "-" for x in incomes],
+                _fmt_money(income_total),
+            )
+        if expense_total > 0:
+            table.add_row(
+                s["name"], "[red]支出[/red]",
+                *[_fmt_amount(x, "expense") if x > 0 else "-" for x in expenses],
+                _fmt_amount(expense_total, "expense"),
+            )
+
+    # 合计行
+    pi = data["period_income"]
+    pe = data["period_expense"]
+    if any(pi) or any(pe):
+        table.add_section()
+        table.add_row(
+            "合计", "[green]收入[/green]",
+            *[_fmt_money(x) if x > 0 else "-" for x in pi],
+            _fmt_money(sum(pi)),
+        )
+        table.add_row(
+            "合计", "[red]支出[/red]",
+            *[_fmt_amount(x, "expense") if x > 0 else "-" for x in pe],
+            _fmt_amount(sum(pe), "expense"),
+        )
+
+    console.print(table)
+
+    if output:
+        if output.lower().endswith(".json"):
+            models.export_report_json(output, data)
+        else:
+            rows = []
+            for s in series:
+                for i, p in enumerate(periods):
+                    if s["income"][i] > 0:
+                        rows.append({
+                            scope: s["name"], "period": p, "type": "income",
+                            "amount": round(s["income"][i], 2),
+                        })
+                    if s["expense"][i] > 0:
+                        rows.append({
+                            scope: s["name"], "period": p, "type": "expense",
+                            "amount": round(s["expense"][i], 2),
+                        })
+            for i, p in enumerate(periods):
+                if pi[i] > 0:
+                    rows.append({scope: "_TOTAL", "period": p, "type": "income", "amount": round(pi[i], 2)})
+                if pe[i] > 0:
+                    rows.append({scope: "_TOTAL", "period": p, "type": "expense", "amount": round(pe[i], 2)})
+            import csv as _csv
+            with open(output, "w", encoding="utf-8-sig", newline="") as f:
+                if rows:
+                    fields = list(rows[0].keys())
+                    writer = _csv.DictWriter(f, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                else:
+                    f.write("")
+        console.print(f"[green]✓[/green] 已导出趋势到 {output}")
+
+
 def _print_category_breakdown(by_category):
     income_total = sum(c["total"] for c in by_category if c["type"] == "income")
     expense_total = sum(c["total"] for c in by_category if c["type"] == "expense")
@@ -885,7 +1008,13 @@ def _read_reconcile_file(file, fmt):
 @click.option("-y", "--yes", is_flag=True, help="非交互：直接对缺失进行批量补记")
 @click.option("--default-category", default=None,
               help="批量补记缺失记录时使用的默认分类")
-def reconcile_run(account, file, fmt, yes, default_category):
+@click.option("-b", "--balance", type=float, default=None,
+              help="银行/平台导出的期末余额，对账后展示差额并可校准")
+@click.option("--show-dupes", is_flag=True,
+              help="额外展示重复流水：银行自身重复 / mny 自身重复 / 两边都重复")
+@click.option("--adjust/--no-adjust", default=False,
+              help="提供外部余额时，是否直接生成校准记录（差额用其他收入/支出记账）")
+def reconcile_run(account, file, fmt, yes, default_category, balance, show_dupes, adjust):
     """用银行/平台导出的流水和 mny 内记录比对
 
     CSV/JSON 字段: amount(负数=支出),date(YYYY-MM-DD),note,category,type(income/expense 可选)
@@ -899,21 +1028,48 @@ def reconcile_run(account, file, fmt, yes, default_category):
         console.print("[yellow]文件为空[/yellow]")
         return
 
-    result = models.reconcile_transactions(records, account)
+    result = models.reconcile_with_balance(records, account, bank_balance=balance)
     matched = result["matched"]
     missing = result["missing_in_mny"]
     extra = result["missing_in_bank"]
     mismatched = result["amount_mismatch"]
 
-    console.print(Panel(
-        f"对账账户: [bold]{result['account']}[/bold]  当前余额: {_fmt_money(result['account_balance'])}\n"
+    header_lines = [
+        f"对账账户: [bold]{result['account']}[/bold]  当前 mny 余额: {_fmt_money(result['account_balance'])}",
         f"已匹配: [green]{matched}[/green]   "
         f"银行有 mny 缺: [yellow]{len(missing)}[/yellow]   "
         f"mny 有银行缺: [cyan]{len(extra)}[/cyan]   "
         f"金额不一致: [red]{len(mismatched)}[/red]",
-        title="🔍 对账结果",
-        border_style="cyan",
-    ))
+    ]
+    if balance is not None:
+        diff = result.get("diff", 0.0)
+        diff_str = _fmt_amount(abs(diff), "income" if diff >= 0 else "expense")
+        if abs(diff) < 0.005:
+            header_lines.append(f"外部余额: {_fmt_money(balance)}  [green]✓ 余额一致[/green]")
+        else:
+            header_lines.append(
+                f"外部余额: {_fmt_money(balance)}  差额: [yellow]{diff_str}[/yellow] "
+                f"（mny {'少记' if diff > 0 else '多记'} {_fmt_money(abs(diff))}）"
+            )
+    console.print(Panel("\n".join(header_lines), title="🔍 对账结果", border_style="cyan"))
+
+    if balance is not None and abs(result.get("diff", 0.0)) >= 0.005:
+        if adjust:
+            try:
+                tx_id = models.create_balance_adjustment(account, balance, tx_date=date.today().isoformat())
+                console.print(
+                    f"[green]✓[/green] 已生成校准记录 #{tx_id}，"
+                    f"mny 余额已对齐至 {_fmt_money(balance)}"
+                )
+            except Exception as e:
+                console.print(f"[red]✗[/red] 校准失败: {e}")
+        else:
+            diff = result["diff"]
+            suggestion = f"其他收入 +{diff:.2f}" if diff > 0 else f"其他支出 {diff:.2f}"
+            console.print(
+                f"💡 修正方案：生成一条 [yellow]{suggestion}[/yellow] 的校准记录。"
+                f" 可加 [cyan]--adjust[/cyan] 直接生成，或手动 `mny add expense/income ...`。"
+            )
 
     if missing:
         table = Table(title=f"❌ mny 中缺失的 {len(missing)} 条银行流水")
@@ -936,7 +1092,7 @@ def reconcile_run(account, file, fmt, yes, default_category):
             if errors:
                 for err in errors:
                     console.print(f"  [yellow]- {err}[/yellow]")
-        elif Confirm.confirm(f"要将这 {len(missing)} 条缺失记录补记到 mny 吗？", default=False):
+        elif Confirm.ask(f"要将这 {len(missing)} 条缺失记录补记到 mny 吗？", default=False):
             for rec in missing:
                 rec["account"] = account
             added, skipped, errors = models.apply_reconcile(missing, default_category)
@@ -973,6 +1129,63 @@ def reconcile_run(account, file, fmt, yes, default_category):
                           _fmt_amount(mm["bank_amount"], m["type"]),
                           m.get("note") or "")
         console.print(table)
+
+    if show_dupes:
+        dup_result = models.find_duplicate_transactions(records, account)
+        dup_bank = dup_result["duplicates_in_bank"]
+        dup_mny = dup_result["duplicates_in_mny"]
+        dup_both = dup_result["duplicates_both"]
+
+        if dup_bank:
+            table = Table(title=f"🔁 银行流水自身重复 {len(dup_bank)} 组（按 类型|日期|金额|备注 聚合）")
+            table.add_column("聚合 Key", overflow="fold")
+            table.add_column("重复次数", justify="right")
+            table.add_column("建议")
+            for d in dup_bank:
+                table.add_row(d["key"], str(d["count"]), "[yellow]忽略多余记录[/yellow]")
+            console.print(table)
+
+        if dup_mny:
+            table = Table(title=f"🔁 mny 自身重复 {len(dup_mny)} 组（按 类型|日期|金额|备注 聚合）")
+            table.add_column("聚合 Key", overflow="fold")
+            table.add_column("mny 重复次数", justify="right")
+            table.add_column("涉及 ID", overflow="fold")
+            table.add_column("操作")
+            for d in dup_mny:
+                ids = ", ".join(str(i["id"]) for i in d["items"])
+                table.add_row(d["key"], str(d["count"]), ids, "[cyan]建议只保留1条，其余删除[/cyan]")
+            console.print(table)
+            if dup_mny and Confirm.ask(
+                "是否删除 mny 中每组重复记录多余的条目（只保留最早的 1 条）？", default=False
+            ):
+                removed = 0
+                for d in dup_mny:
+                    items = sorted(d["items"], key=lambda x: x["id"])
+                    for extra_item in items[1:]:
+                        if models.delete_duplicate_mny_transaction(extra_item["id"]):
+                            removed += 1
+                console.print(f"[green]✓[/green] 删除了 {removed} 条重复交易")
+
+        if dup_both:
+            table = Table(title=f"🔁 两边都重复 {len(dup_both)} 组")
+            table.add_column("聚合 Key", overflow="fold")
+            table.add_column("银行重复", justify="right")
+            table.add_column("mny 重复", justify="right")
+            table.add_column("mny 涉及 ID", overflow="fold")
+            for d in dup_both:
+                ids = ", ".join(str(i["id"]) for i in d["mny_items"])
+                table.add_row(d["key"], str(d["bank_count"]), str(d["mny_count"]), ids)
+            console.print(table)
+            if dup_both and Confirm.ask(
+                "是否把 mny 每组多余的重复条目也清理掉？", default=False
+            ):
+                removed = 0
+                for d in dup_both:
+                    items = sorted(d["mny_items"], key=lambda x: x["id"])
+                    for extra_item in items[1:]:
+                        if models.delete_duplicate_mny_transaction(extra_item["id"]):
+                            removed += 1
+                console.print(f"[green]✓[/green] 删除了 {removed} 条重复交易")
 
 
 # ============================================================
@@ -1094,7 +1307,7 @@ def backup_list(backup_dir):
 def backup_restore(backup_file, yes):
     """从备份恢复数据库（会自动备份当前库）"""
     if not yes:
-        if not Confirm.confirm(
+        if not Confirm.ask(
             f"将用 {backup_file} 覆盖当前数据库（当前库会自动备份），确认？",
             default=False,
         ):
@@ -1237,10 +1450,11 @@ def project_add(name, description):
 def info():
     """显示工具信息"""
     console.print(Panel(
-        f"[bold]mny[/bold] - 命令行记账理财工具 v0.3.0\n\n"
+        f"[bold]mny[/bold] - 命令行记账理财工具 v0.4.0\n\n"
         f"数据库路径: [cyan]{DB_PATH}[/cyan]\n"
         f"使用 '[bold]mny --help[/bold]' 查看全部命令\n"
-        f"核心功能: transfer 转账 / recurring 定期记账 / reconcile 对账 / budget 多维度预算 / backup 备份 / export 导出",
+        f"核心功能: transfer 转账 / recurring 定期记账 / reconcile 对账(含余额校准+重复识别) /\n"
+        f"          budget 多维度滚动预算(支持上月结转) / backup 备份 / export 导出 / trend 趋势视图",
         title="💰 mny",
         border_style="green",
     ))

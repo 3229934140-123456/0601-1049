@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS budgets (
     year INTEGER NOT NULL,
     month INTEGER NOT NULL,
     amount REAL NOT NULL,
+    carry_over REAL DEFAULT 0,
     UNIQUE (scope, scope_key, year, month)
 );
 
@@ -186,6 +187,7 @@ CREATE TABLE IF NOT EXISTS budgets (
     year INTEGER NOT NULL,
     month INTEGER NOT NULL,
     amount REAL NOT NULL,
+    carry_over REAL DEFAULT 0,
     UNIQUE (scope, scope_key, year, month)
 );
                 """)
@@ -198,6 +200,11 @@ CREATE TABLE IF NOT EXISTS budgets (
                             "INSERT INTO budgets (scope, scope_key, year, month, amount) VALUES (?, ?, ?, ?, ?)",
                             ("category", cat_name["name"], r["year"], r["month"], r["amount"]),
                         )
+            if "carry_over" not in cols:
+                try:
+                    conn.execute("ALTER TABLE budgets ADD COLUMN carry_over REAL DEFAULT 0")
+                except Exception:
+                    pass
         except Exception:
             pass
         for name, atype in DEFAULT_ACCOUNTS:
