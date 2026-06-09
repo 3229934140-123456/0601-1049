@@ -87,6 +87,42 @@ CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_tx_account ON transactions(account_id);
 CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(category_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique ON transactions(type, amount, account_id, category_id, date, COALESCE(note, ''));
+
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_account_id INTEGER NOT NULL,
+    to_account_id INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    date TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (from_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (to_account_id) REFERENCES accounts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_date ON transfers(date);
+CREATE INDEX IF NOT EXISTS idx_transfer_from ON transfers(from_account_id);
+CREATE INDEX IF NOT EXISTS idx_transfer_to ON transfers(to_account_id);
+
+CREATE TABLE IF NOT EXISTS recurring (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL CHECK(type IN ('income','expense')),
+    amount REAL NOT NULL,
+    account_id INTEGER NOT NULL,
+    category_id INTEGER NOT NULL,
+    frequency TEXT NOT NULL CHECK(frequency IN ('daily','weekly','monthly','yearly')),
+    interval_day INTEGER,
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    last_generated TEXT,
+    next_date TEXT NOT NULL,
+    note TEXT,
+    tags TEXT,
+    active INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (account_id) REFERENCES accounts(id),
+    FOREIGN KEY (category_id) REFERENCES categories(id)
+);
+CREATE INDEX IF NOT EXISTS idx_recurring_next ON recurring(next_date);
 """
 
 DEFAULT_ACCOUNTS = [
