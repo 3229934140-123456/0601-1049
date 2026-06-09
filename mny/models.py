@@ -80,6 +80,41 @@ def _get_or_create_tag(conn, name: str) -> int:
     return cur.lastrowid
 
 
+# ================================
+# Projects
+# ================================
+def list_projects() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM projects ORDER BY id").fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+
+def get_project(name_or_id: str | int) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        if isinstance(name_or_id, int) or (isinstance(name_or_id, str) and name_or_id.isdigit()):
+            row = conn.execute("SELECT * FROM projects WHERE id = ?", (int(name_or_id),)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM projects WHERE name = ?", (name_or_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def add_project(name: str, description: Optional[str] = None) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (name, description) VALUES (?, ?)",
+            (name, description),
+        )
+        return cur.lastrowid
+
+
+def _get_or_create_project(conn, name: str) -> int:
+    row = conn.execute("SELECT id FROM projects WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row["id"]
+    cur = conn.execute("INSERT INTO projects (name) VALUES (?)", (name,))
+    return cur.lastrowid
+
+
 def add_transaction(
     tx_type: str,
     amount: float,
@@ -88,6 +123,7 @@ def add_transaction(
     tx_date: Optional[str] = None,
     note: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    projects: Optional[List[str]] = None,
 ) -> int:
     acc = get_account(account)
     if not acc:
@@ -121,6 +157,13 @@ def add_transaction(
                     "INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) VALUES (?, ?)",
                     (tx_id, tag_id),
                 )
+        if projects:
+            for p_name in projects:
+                p_id = _get_or_create_project(conn, p_name.strip())
+                conn.execute(
+                    "INSERT OR IGNORE INTO transaction_projects (transaction_id, project_id) VALUES (?, ?)",
+                    (tx_id, p_id),
+                )
         return tx_id
 
 
@@ -135,6 +178,13 @@ def _assemble_tx(conn, row) -> Dict[str, Any]:
         (d["id"],),
     ).fetchall()
     d["tags"] = [r["name"] for r in tag_rows]
+    proj_rows = conn.execute(
+        """SELECT p.name FROM projects p
+           JOIN transaction_projects tp ON p.id = tp.project_id
+           WHERE tp.transaction_id = ?""",
+        (d["id"],),
+    ).fetchall()
+    d["projects"] = [r["name"] for r in proj_rows]
     d["account"] = conn.execute("SELECT name FROM accounts WHERE id = ?", (d["account_id"],)).fetchone()["name"]
     d["category"] = conn.execute("SELECT name FROM categories WHERE id = ?", (d["category_id"],)).fetchone()["name"]
     return d
@@ -154,6 +204,7 @@ def list_transactions(
     category: Optional[str | int] = None,
     keyword: Optional[str] = None,
     tag: Optional[str] = None,
+    project: Optional[str | int] = None,
     limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     sql = "SELECT t.* FROM transactions t WHERE 1=1"
@@ -184,6 +235,13 @@ def list_transactions(
     if tag:
         sql += " AND EXISTS (SELECT 1 FROM transaction_tags tt JOIN tags tg ON tt.tag_id = tg.id WHERE tt.transaction_id = t.id AND tg.name = ?)"
         params.append(tag)
+    if project:
+        if isinstance(project, int) or (isinstance(project, str) and project.isdigit()):
+            sql += " AND EXISTS (SELECT 1 FROM transaction_projects tp WHERE tp.transaction_id = t.id AND tp.project_id = ?)"
+            params.append(int(project))
+        else:
+            sql += " AND EXISTS (SELECT 1 FROM transaction_projects tp JOIN projects p ON tp.project_id = p.id WHERE tp.transaction_id = t.id AND p.name = ?)"
+            params.append(project)
     sql += " ORDER BY t.date DESC, t.id DESC"
     if limit:
         sql += f" LIMIT {int(limit)}"
@@ -202,18 +260,28 @@ def update_transaction(
     tx_date: Optional[str] = None,
     note: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    projects: Optional[List[str]] = None,
 ) -> bool:
     existing = get_transaction(tx_id)
     if not existing:
         raise ValueError(f"交易不存在: {tx_id}")
 
-    updates = []
-    params = []
-
     new_type = tx_type if tx_type else existing["type"]
     new_amount = amount if amount is not None else existing["amount"]
     new_acc_id = get_account(account)["id"] if account else existing["account_id"]
-    new_cat_id = get_category(category, new_type)["id"] if category else existing["category_id"]
+
+    if tx_type and tx_type != existing["type"]:
+        if category is None:
+            raise ValueError(
+                f"类型从 {existing['type']} 改为 {tx_type} 时必须同时指定同类型的分类（原分类 '{existing['category']}' 是 {existing['type']} 类型）"
+            )
+    if category:
+        cat = get_category(category, new_type)
+        if not cat:
+            raise ValueError(f"分类 '{category}' 不存在或与类型 {new_type} 不匹配")
+        new_cat_id = cat["id"]
+    else:
+        new_cat_id = existing["category_id"]
     new_date = tx_date if tx_date else existing["date"]
     new_note = note if note is not None else existing["note"]
 
@@ -244,6 +312,14 @@ def update_transaction(
                     "INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) VALUES (?, ?)",
                     (tx_id, tag_id),
                 )
+        if projects is not None:
+            conn.execute("DELETE FROM transaction_projects WHERE transaction_id = ?", (tx_id,))
+            for p_name in projects:
+                p_id = _get_or_create_project(conn, p_name.strip())
+                conn.execute(
+                    "INSERT OR IGNORE INTO transaction_projects (transaction_id, project_id) VALUES (?, ?)",
+                    (tx_id, p_id),
+                )
         return True
 
 
@@ -261,41 +337,129 @@ def delete_transaction(tx_id: int) -> bool:
         return True
 
 
-def set_budget(category: str | int, year: int, month: int, amount: float) -> int:
-    cat = get_category(category, "expense")
-    if not cat:
-        raise ValueError(f"支出分类不存在: {category}")
+def set_budget(scope: str, scope_key: str, year: int, month: int, amount: float) -> int:
+    if scope not in ("category", "account", "tag", "project"):
+        raise ValueError(f"无效预算维度: {scope}，可选 category/account/tag/project")
+    if amount < 0:
+        raise ValueError("预算金额不能为负数")
+    if scope == "category":
+        cat = get_category(scope_key, "expense")
+        if not cat:
+            raise ValueError(f"支出分类不存在: {scope_key}")
+    elif scope == "account":
+        acc = get_account(scope_key)
+        if not acc:
+            raise ValueError(f"账户不存在: {scope_key}")
     with get_conn() as conn:
         cur = conn.execute(
-            """INSERT INTO budgets (category_id, year, month, amount)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(category_id, year, month) DO UPDATE SET amount=excluded.amount""",
-            (cat["id"], year, month, amount),
+            """INSERT INTO budgets (scope, scope_key, year, month, amount)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(scope, scope_key, year, month) DO UPDATE SET amount=excluded.amount""",
+            (scope, scope_key, year, month, amount),
         )
         return cur.lastrowid
+
+
+def _calc_scope_spent(conn, scope: str, scope_key: str, year: int, month: int) -> float:
+    start = f"{year:04d}-{month:02d}-01"
+    if month == 12:
+        end = f"{year + 1:04d}-01-01"
+    else:
+        end = f"{year:04d}-{month + 1:02d}-01"
+    sql = """
+        SELECT COALESCE(SUM(t.amount), 0)
+        FROM transactions t
+        WHERE t.type = 'expense' AND t.date >= ? AND t.date < ?
+    """
+    params: list = [start, end]
+    if scope == "category":
+        sql += " AND EXISTS (SELECT 1 FROM categories c WHERE c.id = t.category_id AND c.name = ?)"
+        params.append(scope_key)
+    elif scope == "account":
+        sql += " AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = t.account_id AND a.name = ?)"
+        params.append(scope_key)
+    elif scope == "tag":
+        sql += """ AND EXISTS (
+            SELECT 1 FROM transaction_tags tt
+            JOIN tags tg ON tt.tag_id = tg.id
+            WHERE tt.transaction_id = t.id AND tg.name = ?
+        )"""
+        params.append(scope_key)
+    elif scope == "project":
+        sql += """ AND EXISTS (
+            SELECT 1 FROM transaction_projects tp
+            JOIN projects p ON tp.project_id = p.id
+            WHERE tp.transaction_id = t.id AND p.name = ?
+        )"""
+        params.append(scope_key)
+    return conn.execute(sql, params).fetchone()[0]
+
+
+def _calc_scope_recurring(conn, scope: str, scope_key: str, year: int, month: int) -> float:
+    """计算本月该维度下尚未入账但已到期（pending）的定期支出占用预算的金额"""
+    pending = get_pending_recurring(year, month)
+    total = 0.0
+    for p in pending:
+        if p["type"] != "expense":
+            continue
+        if scope == "category" and p["category"] == scope_key:
+            total += p["amount"]
+        elif scope == "account" and p["account"] == scope_key:
+            total += p["amount"]
+        elif scope in ("tag", "project"):
+            if scope_key in p.get("tags", []):
+                total += p["amount"]
+    return total
 
 
 def list_budgets(year: int, month: int) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT b.*, c.name AS category_name
-               FROM budgets b JOIN categories c ON b.category_id = c.id
-               WHERE b.year = ? AND b.month = ?
-               ORDER BY c.name""",
+            """SELECT * FROM budgets WHERE year = ? AND month = ?
+               ORDER BY scope, scope_key""",
             (year, month),
         ).fetchall()
         results = []
         for r in rows:
             d = _row_to_dict(r)
-            spent = conn.execute(
-                """SELECT COALESCE(SUM(amount),0) FROM transactions
-                   WHERE type='expense' AND category_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?""",
-                (r["category_id"], f"{year:04d}", f"{month:02d}"),
-            ).fetchone()[0]
-            d["spent"] = spent
-            d["remaining"] = r["amount"] - spent
+            d["spent"] = _calc_scope_spent(conn, r["scope"], r["scope_key"], year, month)
+            d["remaining"] = r["amount"] - d["spent"]
+            d["recurring_pending"] = _calc_scope_recurring(conn, r["scope"], r["scope_key"], year, month)
+            d["available"] = d["remaining"] - d["recurring_pending"]
             results.append(d)
         return results
+
+
+def get_budget_analysis(year: int, month: int) -> Dict[str, Any]:
+    """返回本月所有预算的分析：剩余、日均、月底预测、定期占用"""
+    today = date.today()
+    budgets = list_budgets(year, month)
+    _, last_day = calendar.monthrange(year, month)
+    days_in_month = last_day
+    current_day = min(today.day, last_day) if today.year == year and today.month == month else last_day
+    remaining_days = max(days_in_month - current_day, 0)
+    results = []
+    for b in budgets:
+        spent = b["spent"]
+        avg = spent / current_day if current_day > 0 else 0
+        projected = spent + avg * remaining_days
+        will_overrun = projected > b["amount"]
+        results.append({
+            **b,
+            "days_passed": current_day,
+            "days_remaining": remaining_days,
+            "daily_avg": avg,
+            "projected_total": projected,
+            "projected_overrun": max(projected - b["amount"], 0),
+            "will_overrun": will_overrun,
+        })
+    return {
+        "year": year,
+        "month": month,
+        "days_passed": current_day,
+        "days_remaining": remaining_days,
+        "budgets": results,
+    }
 
 
 def get_monthly_summary(year: int, month: int) -> Dict[str, Any]:
@@ -663,22 +827,21 @@ def list_recurring(active_only: bool = True) -> List[Dict[str, Any]]:
 
 
 def get_pending_recurring(year: int, month: int) -> List[Dict[str, Any]]:
+    """返回本月内还未入账的固定收支（从 next_date 起算，已生成的自动排除）"""
     start = date(year, month, 1)
     if month == 12:
         end = date(year + 1, 1, 1)
     else:
         end = date(year, month + 1, 1)
-    today = date.today().isoformat()
 
     items = list_recurring(active_only=True)
     pending = []
     for r in items:
         try:
-            cursor = datetime.strptime(r["start_date"], "%Y-%m-%d").date()
+            cursor = datetime.strptime(r["next_date"], "%Y-%m-%d").date()
             end_limit = datetime.strptime(r["end_date"], "%Y-%m-%d").date() if r["end_date"] else None
             while cursor < end:
-                if (cursor >= start and (end_limit is None or cursor <= end_limit)
-                        and cursor.isoformat() >= today):
+                if (cursor >= start and (end_limit is None or cursor <= end_limit)):
                     pending.append({
                         "id": r["id"],
                         "type": r["type"],
@@ -1059,4 +1222,144 @@ def bulk_import_v2(
             except Exception as e:
                 skipped += 1
                 errors.append((idx, f"处理异常: {e}"))
+    return added, skipped, errors
+
+
+# ================================
+# Reconcile (对账)
+# ================================
+def reconcile_transactions(
+    bank_records: List[Dict[str, Any]],
+    account: str | int,
+) -> Dict[str, Any]:
+    """
+    比对银行/支付平台导出的流水与 mny 内已有的交易。
+    bank_records 每条需要至少含: amount, date, [note, category, type]
+    返回 { matched, missing_in_mny, missing_in_bank, amount_mismatch }
+    """
+    acc = get_account(account)
+    if not acc:
+        raise ValueError(f"账户不存在: {account}")
+    acc_id = acc["id"]
+
+    with get_conn() as conn:
+        min_date = min((r.get("date") for r in bank_records if r.get("date")), default=None)
+        max_date = max((r.get("date") for r in bank_records if r.get("date")), default=None)
+        sql = """
+            SELECT t.id, t.type, t.amount, t.date, COALESCE(t.note,'') AS note,
+                   c.name AS category
+            FROM transactions t
+            JOIN categories c ON c.id = t.category_id
+            WHERE t.account_id = ?
+        """
+        params: list = [acc_id]
+        if min_date:
+            sql += " AND t.date >= ?"
+            params.append(min_date)
+        if max_date:
+            sql += " AND t.date <= ?"
+            params.append(max_date)
+        sql += " ORDER BY t.date, t.id"
+        mny_rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    cleaned_bank: List[Dict[str, Any]] = []
+    for rec in bank_records:
+        try:
+            amount = float(rec.get("amount", 0))
+        except (TypeError, ValueError):
+            continue
+        if amount == 0:
+            continue
+        if amount < 0:
+            tx_type = rec.get("type") or "expense"
+            amount = abs(amount)
+        else:
+            tx_type = rec.get("type") or "income"
+        cleaned_bank.append({
+            "type": tx_type,
+            "amount": amount,
+            "date": (rec.get("date") or "").strip() or date.today().isoformat(),
+            "note": (rec.get("note") or "").strip(),
+            "category": (rec.get("category") or "").strip(),
+            "raw": rec,
+        })
+
+    def same_as(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+        return (
+            left["type"] == right["type"]
+            and abs(left["amount"] - right["amount"]) < 0.005
+            and left["date"] == right["date"]
+            and left.get("note", "") == right.get("note", "")
+        )
+
+    used_mny = set()
+    used_bank = set()
+    matched = []
+    amount_mismatch = []
+
+    for i, b in enumerate(cleaned_bank):
+        for j, m in enumerate(mny_rows):
+            if j in used_mny:
+                continue
+            if (m["type"] == b["type"] and m["date"] == b["date"]
+                    and abs(m["amount"] - b["amount"]) < 0.005
+                    and (not b["note"] or m["note"] == b["note"])):
+                used_mny.add(j)
+                used_bank.add(i)
+                matched.append({"mny": m, "bank": b})
+                break
+
+    for i, b in enumerate(cleaned_bank):
+        if i in used_bank:
+            continue
+        for j, m in enumerate(mny_rows):
+            if j in used_mny:
+                continue
+            if (m["type"] == b["type"] and m["date"] == b["date"]
+                    and (not b["note"] or m["note"] == b["note"])
+                    and abs(m["amount"] - b["amount"]) >= 0.005):
+                used_mny.add(j)
+                used_bank.add(i)
+                amount_mismatch.append({"mny": m, "bank": b,
+                                        "mny_amount": m["amount"], "bank_amount": b["amount"]})
+                break
+
+    missing_in_mny = [cleaned_bank[i] for i in range(len(cleaned_bank)) if i not in used_bank]
+    missing_in_bank = [mny_rows[j] for j in range(len(mny_rows)) if j not in used_mny]
+
+    return {
+        "account": acc["name"],
+        "account_balance": acc["balance"],
+        "matched": len(matched),
+        "missing_in_mny": missing_in_mny,
+        "missing_in_bank": missing_in_bank,
+        "amount_mismatch": amount_mismatch,
+    }
+
+
+def apply_reconcile(missing_records: List[Dict[str, Any]],
+                    default_category: Optional[str] = None) -> Tuple[int, int, List[str]]:
+    """把对账查出 missing_in_mny 的缺失记录补记到 mny"""
+    added = 0
+    skipped = 0
+    errors: List[str] = []
+    for rec in missing_records:
+        try:
+            cat = rec.get("category") or default_category
+            if not cat:
+                cat = "其他收入" if rec["type"] == "income" else "其他支出"
+            add_transaction(
+                tx_type=rec["type"],
+                amount=rec["amount"],
+                account=rec.get("account", "现金"),
+                category=cat,
+                tx_date=rec.get("date"),
+                note=rec.get("note"),
+                tags=rec.get("tags"),
+                projects=rec.get("projects"),
+            )
+            added += 1
+        except Exception as e:
+            skipped += 1
+            errors.append(f"{rec.get('date')} {rec.get('amount')}: {e}")
     return added, skipped, errors

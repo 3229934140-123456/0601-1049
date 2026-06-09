@@ -75,12 +75,27 @@ CREATE TABLE IF NOT EXISTS transaction_tags (
 
 CREATE TABLE IF NOT EXISTS budgets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    category_id INTEGER NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('category','account','tag','project')) DEFAULT 'category',
+    scope_key TEXT NOT NULL,
     year INTEGER NOT NULL,
     month INTEGER NOT NULL,
     amount REAL NOT NULL,
-    UNIQUE (category_id, year, month),
-    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+    UNIQUE (scope, scope_key, year, month)
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS transaction_projects (
+    transaction_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    PRIMARY KEY (transaction_id, project_id),
+    FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(date);
@@ -153,6 +168,38 @@ DEFAULT_CATEGORIES = [
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        try:
+            old = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='budgets'"
+            ).fetchone()
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(budgets)").fetchall()]
+            if old and "category_id" in cols and "scope" not in cols:
+                rows = conn.execute(
+                    "SELECT category_id, year, month, amount FROM budgets"
+                ).fetchall()
+                conn.execute("DROP TABLE budgets")
+                conn.executescript("""
+CREATE TABLE IF NOT EXISTS budgets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL CHECK(scope IN ('category','account','tag','project')) DEFAULT 'category',
+    scope_key TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    UNIQUE (scope, scope_key, year, month)
+);
+                """)
+                for r in rows:
+                    cat_name = conn.execute(
+                        "SELECT name FROM categories WHERE id=?", (r["category_id"],)
+                    ).fetchone()
+                    if cat_name:
+                        conn.execute(
+                            "INSERT INTO budgets (scope, scope_key, year, month, amount) VALUES (?, ?, ?, ?, ?)",
+                            ("category", cat_name["name"], r["year"], r["month"], r["amount"]),
+                        )
+        except Exception:
+            pass
         for name, atype in DEFAULT_ACCOUNTS:
             conn.execute(
                 "INSERT OR IGNORE INTO accounts (name, type) VALUES (?, ?)",

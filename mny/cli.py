@@ -57,7 +57,8 @@ def add():
 @click.option("-d", "--date", "tx_date", default=None, help="日期 YYYY-MM-DD，默认今天")
 @click.option("-n", "--note", default=None, help="备注")
 @click.option("-t", "--tags", default=None, help="标签，用逗号分隔")
-def add_income(amount, account, category, tx_date, note, tags):
+@click.option("-p", "--projects", default=None, help="项目，用逗号分隔")
+def add_income(amount, account, category, tx_date, note, tags, projects):
     """记录一笔收入
 
     AMOUNT: 收入金额（必须为正）
@@ -66,8 +67,9 @@ def add_income(amount, account, category, tx_date, note, tags):
         console.print("[red]✗[/red] 收入金额必须为正数")
         return
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
+    proj_list = [p.strip() for p in projects.split(",")] if projects else None
     try:
-        tx_id = models.add_transaction("income", amount, account, category, tx_date, note, tag_list)
+        tx_id = models.add_transaction("income", amount, account, category, tx_date, note, tag_list, proj_list)
         console.print(f"[green]✓[/green] 已记录收入 #{tx_id}: {_fmt_amount(amount, 'income')} | {account} | {category}")
     except ValueError as e:
         console.print(f"[red]✗[/red] {e}")
@@ -80,7 +82,8 @@ def add_income(amount, account, category, tx_date, note, tags):
 @click.option("-d", "--date", "tx_date", default=None, help="日期 YYYY-MM-DD，默认今天")
 @click.option("-n", "--note", default=None, help="备注")
 @click.option("-t", "--tags", default=None, help="标签，用逗号分隔")
-def add_expense(amount, account, category, tx_date, note, tags):
+@click.option("-p", "--projects", default=None, help="项目，用逗号分隔")
+def add_expense(amount, account, category, tx_date, note, tags, projects):
     """记录一笔支出
 
     AMOUNT: 支出金额（必须为正）
@@ -89,8 +92,9 @@ def add_expense(amount, account, category, tx_date, note, tags):
         console.print("[red]✗[/red] 支出金额必须为正数")
         return
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
+    proj_list = [p.strip() for p in projects.split(",")] if projects else None
     try:
-        tx_id = models.add_transaction("expense", amount, account, category, tx_date, note, tag_list)
+        tx_id = models.add_transaction("expense", amount, account, category, tx_date, note, tag_list, proj_list)
         console.print(f"[green]✓[/green] 已记录支出 #{tx_id}: {_fmt_amount(amount, 'expense')} | {account} | {category}")
     except ValueError as e:
         console.print(f"[red]✗[/red] {e}")
@@ -280,7 +284,10 @@ def recurring_toggle(r_id, active):
             models.toggle_recurring(r_id)
         else:
             models.toggle_recurring(r_id, active=active)
-        status = "启用" if active else ("停用" if active is False else "切换")
+        if active is None:
+            status = "切换"
+        else:
+            status = "启用" if active else "停用"
         console.print(f"[green]✓[/green] 定期记账 #{r_id} 已{status}")
     except ValueError as e:
         console.print(f"[red]✗[/red] {e}")
@@ -312,11 +319,12 @@ def recurring_delete(r_id, yes):
 @click.option("-c", "--category", default=None, help="分类筛选")
 @click.option("-k", "--keyword", default=None, help="关键词搜索（备注或分类）")
 @click.option("--tag", default=None, help="标签筛选")
+@click.option("--project", default=None, help="项目筛选")
 @click.option("-n", "--limit", default=None, type=int, help="显示条数")
 @click.option("-o", "--output", default=None, help="导出到文件（.csv 或 .json）")
-def list_cmd(start, end, tx_type, account, category, keyword, tag, limit, output):
+def list_cmd(start, end, tx_type, account, category, keyword, tag, project, limit, output):
     """查询交易流水"""
-    txs = models.list_transactions(start, end, tx_type, account, category, keyword, tag, limit)
+    txs = models.list_transactions(start, end, tx_type, account, category, keyword, tag, project, limit)
     if not txs:
         console.print("[yellow]没有找到匹配的记录[/yellow]")
         if output:
@@ -331,6 +339,7 @@ def list_cmd(start, end, tx_type, account, category, keyword, tag, limit, output
     table.add_column("账户", style="blue")
     table.add_column("分类", style="yellow")
     table.add_column("标签", style="green")
+    table.add_column("项目", style="cyan")
     table.add_column("备注", style="white")
 
     total_income = 0.0
@@ -345,7 +354,8 @@ def list_cmd(start, end, tx_type, account, category, keyword, tag, limit, output
         table.add_row(
             str(tx["id"]), tx["date"], ttype,
             _fmt_amount(tx["amount"], tx["type"]),
-            tx["account"], tx["category"], ", ".join(tx["tags"]),
+            tx["account"], tx["category"], ", ".join(tx.get("tags", [])),
+            ", ".join(tx.get("projects", [])),
             tx.get("note") or "",
         )
 
@@ -381,7 +391,8 @@ def edit():
 @click.option("-d", "--date", "tx_date", default=None, help="日期")
 @click.option("-n", "--note", default=None, help="备注")
 @click.option("-t", "--tags", default=None, help="标签，逗号分隔（覆盖原标签）")
-def edit_update(tx_id, tx_type, amount, account, category, tx_date, note, tags):
+@click.option("-p", "--projects", default=None, help="项目，逗号分隔（覆盖原项目）")
+def edit_update(tx_id, tx_type, amount, account, category, tx_date, note, tags, projects):
     """修改交易记录
 
     TX_ID: 交易ID
@@ -390,8 +401,55 @@ def edit_update(tx_id, tx_type, amount, account, category, tx_date, note, tags):
         console.print("[red]✗[/red] 金额必须为正数")
         return
     tag_list = [t.strip() for t in tags.split(",")] if tags is not None else None
+    proj_list = [p.strip() for p in projects.split(",")] if projects is not None else None
+
+    existing = models.get_transaction(tx_id)
+    if not existing:
+        console.print(f"[red]✗[/red] 交易不存在: #{tx_id}")
+        return
+
+    new_type = tx_type if tx_type else existing["type"]
+    new_category = category
+    if tx_type and tx_type != existing["type"]:
+        old_cat_type = existing["type"]
+        if category is None:
+            console.print(
+                f"[yellow]⚠[/yellow] 类型从 [bold]{old_cat_type}[/bold] 改为 [bold]{tx_type}[/bold]，"
+                f"原分类 '{existing['category']}' 属于 {old_cat_type}，需要重新选择 {tx_type} 分类"
+            )
+            alt_cats = models.list_categories(tx_type)
+            names = [c["name"] for c in alt_cats]
+            console.print(f"可选的 {tx_type} 分类: {', '.join(names)}")
+            answer = Prompt.ask(
+                f"请选择一个 {tx_type} 分类（或输入新分类名自动创建）",
+                default=names[0] if names else "",
+                show_default=False,
+            )
+            new_category = answer.strip() if answer.strip() else None
+            if not new_category:
+                console.print("[yellow]已取消[/yellow]")
+                return
+        else:
+            cat_check = models.get_category(category, tx_type)
+            if not cat_check:
+                console.print(
+                    f"[yellow]⚠[/yellow] 指定的分类 '{category}' 不是 {tx_type} 类型"
+                )
+                alt_cats = models.list_categories(tx_type)
+                names = [c["name"] for c in alt_cats]
+                console.print(f"可选的 {tx_type} 分类: {', '.join(names)}")
+                answer = Prompt.ask(
+                    f"请选择一个 {tx_type} 分类（或输入新分类名自动创建）",
+                    default=names[0] if names else "",
+                    show_default=False,
+                )
+                new_category = answer.strip() if answer.strip() else None
+                if not new_category:
+                    console.print("[yellow]已取消[/yellow]")
+                    return
+
     try:
-        models.update_transaction(tx_id, tx_type, amount, account, category, tx_date, note, tag_list)
+        models.update_transaction(tx_id, tx_type, amount, account, new_category, tx_date, note, tag_list, proj_list)
         tx = models.get_transaction(tx_id)
         console.print(f"[green]✓[/green] 已更新 #{tx_id}")
         _print_tx_detail(tx)
@@ -430,29 +488,36 @@ def _print_tx_detail(tx):
     table.add_row("金额", _fmt_amount(tx["amount"], tx["type"]))
     table.add_row("账户", tx["account"])
     table.add_row("分类", tx["category"])
-    table.add_row("标签", ", ".join(tx["tags"]))
+    table.add_row("标签", ", ".join(tx.get("tags", [])))
+    table.add_row("项目", ", ".join(tx.get("projects", [])))
     table.add_row("备注", tx.get("note") or "")
     console.print(table)
 
 
 # ============================================================
-# budget: 预算
+# budget: 预算（多维度）
 # ============================================================
 @cli.group()
 def budget():
-    """管理月度分类预算"""
+    """管理月度预算（支持分类/账户/标签/项目多维度）"""
     pass
 
 
 @budget.command("set")
-@click.argument("category")
+@click.option("-s", "--scope", default="category",
+              type=click.Choice(["category", "account", "tag", "project"]),
+              show_default=True, help="预算维度")
+@click.argument("key")
 @click.argument("amount", type=float)
 @click.option("-y", "--year", type=int, default=None, help="年份，默认今年")
 @click.option("-m", "--month", type=int, default=None, help="月份，默认本月")
-def budget_set(category, amount, year, month):
-    """设置月度预算"""
-    if amount <= 0:
-        console.print("[red]✗[/red] 预算金额必须为正数")
+def budget_set(scope, key, amount, year, month):
+    """设置月度预算（支持分类/账户/标签/项目）
+
+    KEY: 维度对应的名称，例如 '餐饮'（分类）/ '银行卡'（账户）/ '出差'（标签）
+    """
+    if amount < 0:
+        console.print("[red]✗[/red] 预算金额不能为负数")
         return
     today = date.today()
     if year is None:
@@ -460,8 +525,8 @@ def budget_set(category, amount, year, month):
     if month is None:
         month = today.month
     try:
-        models.set_budget(category, year, month, amount)
-        console.print(f"[green]✓[/green] 已设置 {year}-{month:02d} {category} 预算: ¥{amount:,.2f}")
+        models.set_budget(scope, key, year, month, amount)
+        console.print(f"[green]✓[/green] 已设置 {year}-{month:02d} {scope}={key} 预算: ¥{amount:,.2f}")
     except ValueError as e:
         console.print(f"[red]✗[/red] {e}")
 
@@ -470,29 +535,37 @@ def budget_set(category, amount, year, month):
 @click.option("-y", "--year", type=int, default=None, help="年份，默认今年")
 @click.option("-m", "--month", type=int, default=None, help="月份，默认本月")
 def budget_list(year, month):
-    """查看月度预算及使用情况"""
+    """查看月度预算及使用情况、月底预测、固定支出占用"""
     today = date.today()
     if year is None:
         year = today.year
     if month is None:
         month = today.month
 
-    budgets = models.list_budgets(year, month)
+    analysis = models.get_budget_analysis(year, month)
+    budgets = analysis["budgets"]
     if not budgets:
         console.print(f"[yellow]{year}-{month:02d} 暂无预算设置[/yellow]")
         return
 
-    table = Table(title=f"{year}-{month:02d} 预算概览")
-    table.add_column("分类", style="yellow")
+    table = Table(title=f"{year}-{month:02d} 预算概览（已过 {analysis['days_passed']} 天，剩 {analysis['days_remaining']} 天）")
+    table.add_column("维度", style="cyan")
+    table.add_column("对象", style="yellow")
     table.add_column("预算", justify="right", style="cyan")
     table.add_column("已用", justify="right")
-    table.add_column("剩余", justify="right")
-    table.add_column("进度", justify="center")
+    table.add_column("待入账", justify="right", style="magenta")
+    table.add_column("可用", justify="right")
+    table.add_column("日均", justify="right", style="dim")
+    table.add_column("月底预测", justify="right")
+    table.add_column("状态", justify="center")
 
     for b in budgets:
         pct = (b["spent"] / b["amount"] * 100) if b["amount"] > 0 else 0
-        if pct >= 100:
-            status = f"[red]超支 {pct - 100:.0f}%[/red]"
+        if b["will_overrun"]:
+            status = f"[red]预计超支[/red]"
+            remaining_style = "red"
+        elif pct >= 100:
+            status = f"[red]已超支 {pct - 100:.0f}%[/red]"
             remaining_style = "red"
         elif pct >= 80:
             status = f"[yellow]警告 {pct:.0f}%[/yellow]"
@@ -501,22 +574,19 @@ def budget_list(year, month):
             status = f"[green]正常 {pct:.0f}%[/green]"
             remaining_style = "green"
 
-        bar_len = 20
-        filled = int(min(pct / 100, 1) * bar_len)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        if pct >= 100:
-            bar = f"[red]{bar}[/red]"
-        elif pct >= 80:
-            bar = f"[yellow]{bar}[/yellow]"
-        else:
-            bar = f"[green]{bar}[/green]"
+        predicted_str = _fmt_money(b["projected_total"])
+        if b["will_overrun"]:
+            predicted_str += f" [red](超 ¥{b['projected_overrun']:,.2f})[/red]"
 
         table.add_row(
-            b["category_name"],
+            b["scope"], b["scope_key"],
             f"¥{b['amount']:,.2f}",
             f"¥{b['spent']:,.2f}",
-            f"[{remaining_style}]¥{b['remaining']:,.2f}[/{remaining_style}]",
-            f"{bar} {status}",
+            f"¥{b['recurring_pending']:,.2f}" if b["recurring_pending"] > 0 else "-",
+            f"[{remaining_style}]¥{b['available']:,.2f}[/{remaining_style}]",
+            f"¥{b['daily_avg']:,.2f}",
+            predicted_str,
+            status,
         )
 
     console.print(table)
@@ -574,6 +644,34 @@ def _show_pending_recurring(year, month):
     )
 
 
+def _show_budget_analysis(year, month):
+    analysis = models.get_budget_analysis(year, month)
+    budgets = analysis["budgets"]
+    if not budgets:
+        return
+    table = Table(title=f"🎯 {year}-{month:02d} 预算状态 & 月底预测")
+    table.add_column("维度", style="cyan")
+    table.add_column("对象", style="yellow")
+    table.add_column("预算", justify="right", style="cyan")
+    table.add_column("已用", justify="right")
+    table.add_column("固定支出待入账", justify="right", style="magenta")
+    table.add_column("可用", justify="right")
+    table.add_column("月底预测", justify="right")
+    for b in budgets:
+        predicted_str = _fmt_money(b["projected_total"])
+        if b["will_overrun"]:
+            predicted_str += f" [red]超支¥{b['projected_overrun']:,.2f}[/red]"
+        table.add_row(
+            b["scope"], b["scope_key"],
+            f"¥{b['amount']:,.2f}",
+            f"¥{b['spent']:,.2f}",
+            f"¥{b['recurring_pending']:,.2f}" if b["recurring_pending"] > 0 else "-",
+            _fmt_money(b["available"]),
+            predicted_str,
+        )
+    console.print(table)
+
+
 @report.command("weekly")
 @click.option("-o", "--output", default=None, help="导出（csv/json）")
 def report_weekly(output):
@@ -613,6 +711,7 @@ def report_monthly(year, month, output):
         border_style="blue",
     ))
     _print_category_breakdown(data["by_category"])
+    _show_budget_analysis(year, month)
     _show_pending_recurring(year, month)
     _maybe_export_report(data, output)
 
@@ -749,6 +848,130 @@ def _print_category_breakdown(by_category):
             filled = int(pct / 100 * bar_len)
             bar = "█" * filled + "░" * (bar_len - filled)
             table.add_row(c["category"], _fmt_amount(c["total"], c["type"]), f"{pct:.1f}%", f"[red]{bar}[/red]")
+        console.print(table)
+
+
+# ============================================================
+# reconcile: 对账
+# ============================================================
+@cli.group()
+def reconcile():
+    """对账/校准：对比银行流水与 mny 内部记录"""
+    pass
+
+
+def _read_reconcile_file(file, fmt):
+    records = []
+    if fmt == "csv":
+        with open(file, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                records.append(dict(row))
+    else:
+        with open(file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                records = data
+            else:
+                raise ValueError("JSON 必须是数组格式")
+    return records
+
+
+@reconcile.command("run")
+@click.argument("account")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("-f", "--format", "fmt", default="csv",
+              type=click.Choice(["csv", "json"]), show_default=True, help="文件格式")
+@click.option("-y", "--yes", is_flag=True, help="非交互：直接对缺失进行批量补记")
+@click.option("--default-category", default=None,
+              help="批量补记缺失记录时使用的默认分类")
+def reconcile_run(account, file, fmt, yes, default_category):
+    """用银行/平台导出的流水和 mny 内记录比对
+
+    CSV/JSON 字段: amount(负数=支出),date(YYYY-MM-DD),note,category,type(income/expense 可选)
+    """
+    try:
+        records = _read_reconcile_file(file, fmt)
+    except Exception as e:
+        console.print(f"[red]✗[/red] 读取文件失败: {e}")
+        return
+    if not records:
+        console.print("[yellow]文件为空[/yellow]")
+        return
+
+    result = models.reconcile_transactions(records, account)
+    matched = result["matched"]
+    missing = result["missing_in_mny"]
+    extra = result["missing_in_bank"]
+    mismatched = result["amount_mismatch"]
+
+    console.print(Panel(
+        f"对账账户: [bold]{result['account']}[/bold]  当前余额: {_fmt_money(result['account_balance'])}\n"
+        f"已匹配: [green]{matched}[/green]   "
+        f"银行有 mny 缺: [yellow]{len(missing)}[/yellow]   "
+        f"mny 有银行缺: [cyan]{len(extra)}[/cyan]   "
+        f"金额不一致: [red]{len(mismatched)}[/red]",
+        title="🔍 对账结果",
+        border_style="cyan",
+    ))
+
+    if missing:
+        table = Table(title=f"❌ mny 中缺失的 {len(missing)} 条银行流水")
+        table.add_column("日期", style="magenta")
+        table.add_column("类型", justify="center")
+        table.add_column("金额", justify="right")
+        table.add_column("分类", style="yellow")
+        table.add_column("备注")
+        for m in missing:
+            ttype = "[green]收入[/green]" if m["type"] == "income" else "[red]支出[/red]"
+            table.add_row(m["date"], ttype, _fmt_amount(m["amount"], m["type"]),
+                          m.get("category") or "-", m.get("note") or "")
+        console.print(table)
+
+        if yes:
+            for rec in missing:
+                rec["account"] = account
+            added, skipped, errors = models.apply_reconcile(missing, default_category)
+            console.print(f"[green]✓[/green] 已批量补记 {added} 条" + (f"，跳过 {skipped} 条" if skipped else ""))
+            if errors:
+                for err in errors:
+                    console.print(f"  [yellow]- {err}[/yellow]")
+        elif Confirm.confirm(f"要将这 {len(missing)} 条缺失记录补记到 mny 吗？", default=False):
+            for rec in missing:
+                rec["account"] = account
+            added, skipped, errors = models.apply_reconcile(missing, default_category)
+            console.print(f"[green]✓[/green] 已补记 {added} 条" + (f"，跳过 {skipped} 条" if skipped else ""))
+            if errors:
+                for err in errors:
+                    console.print(f"  [yellow]- {err}[/yellow]")
+
+    if extra:
+        table = Table(title=f"⚠ mny 有但银行没出现的 {len(extra)} 条（可能是漏记、重复或日期不一致）")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("日期", style="magenta")
+        table.add_column("类型", justify="center")
+        table.add_column("金额", justify="right")
+        table.add_column("分类", style="yellow")
+        table.add_column("备注")
+        for e in extra:
+            ttype = "[green]收入[/green]" if e["type"] == "income" else "[red]支出[/red]"
+            table.add_row(str(e["id"]), e["date"], ttype, _fmt_amount(e["amount"], e["type"]),
+                          e.get("category") or "-", e.get("note") or "")
+        console.print(table)
+
+    if mismatched:
+        table = Table(title=f"🔴 金额不一致的 {len(mismatched)} 条")
+        table.add_column("mny ID", style="cyan", justify="right")
+        table.add_column("日期", style="magenta")
+        table.add_column("mny 金额", justify="right")
+        table.add_column("银行金额", justify="right", style="red")
+        table.add_column("备注")
+        for mm in mismatched:
+            m = mm["mny"]
+            table.add_row(str(m["id"]), m["date"],
+                          _fmt_amount(mm["mny_amount"], m["type"]),
+                          _fmt_amount(mm["bank_amount"], m["type"]),
+                          m.get("note") or "")
         console.print(table)
 
 
@@ -901,9 +1124,10 @@ def export():
 @click.option("-c", "--category", default=None)
 @click.option("-k", "--keyword", default=None)
 @click.option("--tag", default=None)
-def export_transactions(output, start, end, tx_type, account, category, keyword, tag):
+@click.option("--project", default=None)
+def export_transactions(output, start, end, tx_type, account, category, keyword, tag, project):
     """导出交易流水"""
-    txs = models.list_transactions(start, end, tx_type, account, category, keyword, tag)
+    txs = models.list_transactions(start, end, tx_type, account, category, keyword, tag, project)
     if not txs:
         console.print("[yellow]无数据可导出[/yellow]")
         return
@@ -915,7 +1139,7 @@ def export_transactions(output, start, end, tx_type, account, category, keyword,
 
 
 # ============================================================
-# account / category / info
+# account / category / project / info
 # ============================================================
 @cli.group()
 def account():
@@ -978,14 +1202,45 @@ def category_add(name, ctype):
     console.print(f"[green]✓[/green] 已添加{ttype}分类: {name}")
 
 
+@cli.group()
+def project():
+    """管理项目"""
+    pass
+
+
+@project.command("list")
+def project_list():
+    """列出所有项目"""
+    projs = models.list_projects()
+    if not projs:
+        console.print("[yellow]暂无项目[/yellow]")
+        return
+    table = Table(title="项目列表")
+    table.add_column("ID", justify="right", style="cyan")
+    table.add_column("名称", style="cyan")
+    table.add_column("描述", style="dim")
+    for p in projs:
+        table.add_row(str(p["id"]), p["name"], p.get("description") or "")
+    console.print(table)
+
+
+@project.command("add")
+@click.argument("name")
+@click.option("-d", "--description", default=None, help="项目描述")
+def project_add(name, description):
+    """新增项目"""
+    models.add_project(name, description)
+    console.print(f"[green]✓[/green] 已添加项目: {name}")
+
+
 @cli.command("info")
 def info():
     """显示工具信息"""
     console.print(Panel(
-        f"[bold]mny[/bold] - 命令行记账理财工具 v0.2.0\n\n"
+        f"[bold]mny[/bold] - 命令行记账理财工具 v0.3.0\n\n"
         f"数据库路径: [cyan]{DB_PATH}[/cyan]\n"
         f"使用 '[bold]mny --help[/bold]' 查看全部命令\n"
-        f"新功能: transfer 转账 / recurring 定期记账 / backup 备份恢复 / export 导出",
+        f"核心功能: transfer 转账 / recurring 定期记账 / reconcile 对账 / budget 多维度预算 / backup 备份 / export 导出",
         title="💰 mny",
         border_style="green",
     ))
